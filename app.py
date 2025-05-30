@@ -28,7 +28,6 @@ SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
-# Validate critical environment variables at startup
 if not OPENAI_API_KEY:
     logging.error("CRITICAL: OPENAI_API_KEY environment variable not set at application startup.")
 if not SMTP_USERNAME or not SMTP_PASSWORD:
@@ -99,11 +98,14 @@ Call Flow:
   Then ask:
     “What type of appointment would you like to book today? Skin check, cosmetic, or laser?”
   Then collect:
-    - Caller’s name
-    - Phone number
-    - Preferred date
-  Conclude with:
+    - Caller’s name (if they give it)
+    - Phone number (if they give it)
+    - Preferred date (if they give it)
+
+  If the caller only gives partial information, still respond with:
     “Thanks! I’ll send this to the team to confirm via SMS.”
+
+  Do not fall back unless the user says something completely unrelated or unintelligible.
 
 • Cancel Appointment →
   Ask for name and date of appointment
