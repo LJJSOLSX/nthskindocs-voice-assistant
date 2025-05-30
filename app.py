@@ -6,7 +6,7 @@ Flask + Twilio + OpenAI GPT‑4o
 import os
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
-import openai
+from openai import OpenAI
 import smtplib
 from email.message import EmailMessage
 
@@ -19,8 +19,6 @@ SMTP_SERVER    = os.getenv("SMTP_SERVER", "localhost")
 SMTP_PORT      = int(os.getenv("SMTP_PORT", "25"))
 SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
-
-openai.api_key = OPENAI_API_KEY
 
 # ------------------------------------------------------------------
 # Helper: Send email (simple SMTP; replace with SendGrid if preferred)
@@ -67,9 +65,11 @@ Call‑flow summary:
 # Flask application
 # ------------------------------------------------------------------
 app = Flask(__name__)
+
 @app.route("/", methods=["GET"])
 def home():
     return "✅ Sol is alive and ready. Use /voice for calls.", 200
+
 @app.route("/voice", methods=["POST"])
 def voice_webhook():
     """
@@ -88,18 +88,22 @@ def voice_webhook():
         conversation.append({"role": "user", "content": speech_result})
 
     # Ask GPT‑4o for the next assistant reply
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",   # swap to "gpt-4o" if you have access
-        messages=conversation,
-        temperature=0.3,
-    )
-    assistant_reply = response.choices[0].message.content
+    try:
+        client = OpenAI()
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=conversation,
+            temperature=0.3,
+        )
+        assistant_reply = response.choices[0].message.content
+    except Exception as e:
+        assistant_reply = "Sorry, something went wrong. I’ll send your message to the team."
+        send_email("Sol Error", str(e))
 
     # ----------------------------------------------------------------
     # Detect if this needs escalation or emergency handling
     # ----------------------------------------------------------------
     if "000" in assistant_reply or "hang up" in assistant_reply.lower():
-        # Emergency path – no further gathering, just speak & end call
         vr = VoiceResponse()
         vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
         return Response(str(vr), mimetype="text/xml")
