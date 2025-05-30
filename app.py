@@ -28,17 +28,25 @@ SMTP_PORT      = int(os.getenv("SMTP_PORT", "587")) # Default is string, convert
 SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
-# Validate critical environment variables
+# Validate critical environment variables at startup
 if not OPENAI_API_KEY:
     logging.error("CRITICAL: OPENAI_API_KEY environment variable not set.")
-    # Consider exiting or raising an error if essential for startup
+    # Application might not function correctly without this.
+    # Consider raising an error or exiting if it's truly fatal for startup.
 if not SMTP_USERNAME or not SMTP_PASSWORD:
     logging.warning("SMTP_USERNAME or SMTP_PASSWORD environment variable not set. Email sending may fail.")
 
+# Initialize OpenAI client
 try:
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    if OPENAI_API_KEY:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        logging.info("OpenAI client initialized successfully.")
+    else:
+        client = None
+        logging.error("OpenAI client NOT initialized due to missing API key.")
 except Exception as e:
     logging.error(f"Failed to initialize OpenAI client: {e}")
+    logging.error(traceback.format_exc())
     client = None # Ensure client is None if initialization fails
 
 # ------------------------------------------------------------------
@@ -51,13 +59,13 @@ def send_email(subject: str, body: str):
 
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"]    = f"Sol Voice Assistant <no-reply@northernskindoctors.com.au>" # More descriptive From
+    msg["From"]    = f"Sol Voice Assistant <no-reply@northernskindoctors.com.au>"
     msg["To"]      = ADMIN_EMAIL
     msg.set_content(body)
 
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
-            smtp.starttls()
+            smtp.starttls() # Secure the connection
             smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(msg)
         logging.info(f"Email sent successfully to {ADMIN_EMAIL} with subject: {subject}")
@@ -104,38 +112,39 @@ def home():
 @app.route("/voice", methods=["POST"])
 def voice_webhook():
     speech_result = request.values.get("SpeechResult", "").strip()
-    call_sid      = request.values.get("CallSid", "UnknownCallSid") # Provide a default
+    call_sid      = request.values.get("CallSid", "UnknownCallSid")
     logging.info(f"Received POST to /voice. CallSid: {call_sid}. SpeechResult: '{speech_result}'")
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
-    if speech_result: # Only add user message if there's actual input
+    if speech_result:
         messages.append({"role": "user", "content": speech_result})
-    # If speech_result is empty (e.g., initial call), GPT will use the system prompt
-    # to generate the initial greeting.
 
-    assistant_reply = "Sorry, I encountered an issue. I'll notify the team." # Default reply
+    assistant_reply = "Sorry, I encountered an issue processing your request. I'll notify the team."
 
     if not client:
-        logging.error("OpenAI client is not initialized. Cannot process request.")
-        # Fallback email might be appropriate here if you want to notify admin
-        # send_email("Sol Critical Error - OpenAI Client", "OpenAI client failed to initialize.")
+        logging.error("OpenAI client is not initialized. Cannot process request to OpenAI.")
+        # The default assistant_reply will be used.
+        # Optionally, send an email here if this state is reached.
+        send_email(
+            subject=f"[Sol Critical Error] OpenAI Client Not Initialized - Call {call_sid}",
+            body=f"Attempted to process a request, but OpenAI client is not initialized.\nCaller said: {speech_result}"
+        )
     else:
         try:
             logging.info(f"Sending messages to OpenAI: {messages}")
             response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=messages,
-                temperature=0.3, # Lower temperature for more deterministic responses
+                temperature=0.3,
             )
             assistant_reply = response.choices[0].message.content
             logging.info(f"OpenAI response received: '{assistant_reply}'")
         except Exception as e:
             logging.error(f"OpenAI API call failed: {e}")
             logging.error(traceback.format_exc())
-            assistant_reply = "Sorry, something went wrong on my end. I’ll send your message to the team."
-            # Send an email about the error
+            assistant_reply = "Sorry, something went wrong while I was thinking. I’ll send your message to the team."
             send_email(
                 subject=f"[Sol Error] OpenAI API Failure - Call {call_sid}",
                 body=f"An error occurred while communicating with OpenAI.\n\nCaller said: {speech_result}\nError: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
@@ -143,62 +152,44 @@ def voice_webhook():
 
     vr = VoiceResponse()
 
-    # Check for emergency phrases in assistant's reply (as per system prompt)
     if "000" in assistant_reply or "hang up and call 000" in assistant_reply.lower():
         vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
-        # NOTE: Ensure "Polly.Brian" is available in your Twilio account or use a standard voice like "alice".
-        # For emergency, we typically just say the message and hang up.
-        # vr.hangup() # Optional: explicitly hang up
         logging.info(f"Emergency detected in reply. Saying: '{assistant_reply}' and ending interaction.")
         return Response(str(vr), mimetype="text/xml")
 
-    # Check for fallback phrases (as per system prompt)
     if "didn’t quite catch that" in assistant_reply.lower() or \
-       "sorry, something went wrong" in assistant_reply.lower(): # Catching our own error message too
-        logging.info(f"Fallback detected. Sending email for CallSid: {call_sid}")
+       "sorry, something went wrong" in assistant_reply.lower() or \
+       "sorry, I encountered an issue" in assistant_reply.lower(): # Catching our own error messages
+        logging.info(f"Fallback or error condition detected. Sending email for CallSid: {call_sid}")
         send_email(
-            subject=f"[NthSkinDocs] Fallback/Unclear Query from call {call_sid}",
+            subject=f"[NthSkinDocs] Fallback/Error from call {call_sid}",
             body=f"Caller said: {speech_result}\nAssistant reply: {assistant_reply}"
         )
-        # For fallback, the bot says the message and then might gather again or hang up.
-        # Your current logic gathers again, which is fine.
 
-    # Standard interaction: Say the reply and gather more input
     vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
-    # NOTE: Ensure "Polly.Brian" is available in your Twilio account.
-    # Standard voices: "alice", "man", "woman". Language "en-AU" is good.
+    # Note on voice: Ensure "Polly.Brian" is available in your Twilio account.
+    # Standard Twilio voices include "alice", "man", "woman". "en-AU" is a valid language.
     gather = Gather(
         input="speech",
-        action="/voice", # Send subsequent speech back to this same webhook
+        action="/voice",
         method="POST",
-        timeout=5,        # Seconds to wait for speech
-        speechTimeout="auto" # Let Twilio determine end of speech
-        # consider adding `actionOnEmptyResult="true"` if you want to handle silence
+        timeout=5,
+        speechTimeout="auto"
     )
     vr.append(gather)
-    # To explicitly hang up after the assistant speaks and doesn't need more input:
-    # vr.hangup() # Uncomment if the conversation should end here for certain intents
 
     logging.info(f"Responding with TwiML: {str(vr)}")
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Run server locally (for development)
+# Run server locally (for development) or for hosting platforms
 # ------------------------------------------------------------------
 if __name__ == "__main__":
-    # For production, use a WSGI server like Gunicorn or Waitress.
-    # Example: gunicorn app:app
-    # Ensure DEBUG is False in production.
-    port = int(os.environ.get("PORT", 5000)) # Common for hosting platforms
-    app.run(host="0.0.0.0", port=port, debug=False) # Set debug=False for production
-```
-# Example requirements.txt file (save this as requirements.txt in your project root)
-# Flask==2.3.3  # Or your specific version
-# openai==1.17.0 # Or your specific version
-# twilio==8.9.1  # Or your specific version
-# python-dotenv # Optional, for loading .env files locally
-# gunicorn      # Optional, if using Gunicorn for deployment
-
-# ------------------------------------------------------------------
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # For production, ensure DEBUG is False.
+    # Hosting platforms like Render often set the PORT environment variable.
+    port = int(os.environ.get("PORT", 5000))
+    # When deploying to Render or similar, they often use their own command
+    # (e.g., gunicorn app:app or what's in your Procfile/Start Command).
+    # This app.run() is mainly for local development or simple deployments.
+    # Set debug=False for any production or publicly accessible instance.
+    app.run(host="0.0.0.0", port=port, debug=False)
