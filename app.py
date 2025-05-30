@@ -21,12 +21,12 @@ SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
 # ------------------------------------------------------------------
-# Helper: Send email (simple SMTP; replace with SendGrid if preferred)
+# Helper: Send email (via SendGrid or SMTP)
 # ------------------------------------------------------------------
 def send_email(subject: str, body: str):
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"]    = "no-reply@northernskindoctors.com.au"
+    msg["From"]    = SMTP_USERNAME  # ✅ use your verified SendGrid user
     msg["To"]      = ADMIN_EMAIL
     msg.set_content(body)
 
@@ -36,7 +36,7 @@ def send_email(subject: str, body: str):
         smtp.send_message(msg)
 
 # ------------------------------------------------------------------
-# GPT‑4o prompt template
+# GPT‑4o system prompt
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """You are Sol, the warm, friendly virtual receptionist \
 for Northern Skin Doctors (NthSkinDocs). \
@@ -62,7 +62,7 @@ Call‑flow summary:
 """
 
 # ------------------------------------------------------------------
-# Flask application
+# Flask app + routes
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -72,24 +72,19 @@ def home():
 
 @app.route("/voice", methods=["POST"])
 def voice_webhook():
-    """
-    Main Twilio Voice webhook.
-    Twilio passes SpeechResult only after <Gather>; for first greeting
-    we send a prompt with <Gather> to collect caller speech.
-    """
     speech_result = request.values.get("SpeechResult", "").strip()
     call_sid      = request.values.get("CallSid")
 
-    # Build conversation for GPT‑4o
+    # Construct conversation
     conversation = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
     if speech_result:
         conversation.append({"role": "user", "content": speech_result})
 
-    # Ask GPT‑4o for the next assistant reply
+    # Call GPT-4o
     try:
-        client = OpenAI()
+        client = OpenAI(api_key=OPENAI_API_KEY)
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=conversation,
@@ -100,24 +95,20 @@ def voice_webhook():
         assistant_reply = "Sorry, something went wrong. I’ll send your message to the team."
         send_email("Sol Error", str(e))
 
-    # ----------------------------------------------------------------
-    # Detect if this needs escalation or emergency handling
-    # ----------------------------------------------------------------
+    # Emergency handling
     if "000" in assistant_reply or "hang up" in assistant_reply.lower():
         vr = VoiceResponse()
         vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
         return Response(str(vr), mimetype="text/xml")
 
-    # For fallback or unclear queries, email transcript
+    # Fallback handling
     if "didn’t quite catch" in assistant_reply.lower():
         send_email(
             subject=f"[NthSkinDocs] Fallback from call {call_sid}",
             body=f"Caller said: {speech_result}\nAssistant reply: {assistant_reply}"
         )
 
-    # ----------------------------------------------------------------
-    # Build TwiML with <Gather> to continue the conversation
-    # ----------------------------------------------------------------
+    # Continue conversation
     vr = VoiceResponse()
     vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
     gather = Gather(
@@ -131,7 +122,7 @@ def voice_webhook():
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Entry point
+# Entry
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
