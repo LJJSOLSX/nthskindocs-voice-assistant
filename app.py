@@ -22,33 +22,32 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Configuration - CRITICAL: These MUST be set in your hosting environment
 # ------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@northernskindoctors.com.au")
+ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@northernskindoctors.com.au") # Ensure this is your desired admin email
 SMTP_SERVER    = os.getenv("SMTP_SERVER", "smtp.sendgrid.net")
-SMTP_PORT      = int(os.getenv("SMTP_PORT", "587")) # Default is string, convert to int
+SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
 # Validate critical environment variables at startup
 if not OPENAI_API_KEY:
-    logging.error("CRITICAL: OPENAI_API_KEY environment variable not set.")
-    # Application might not function correctly without this.
-    # Consider raising an error or exiting if it's truly fatal for startup.
+    logging.error("CRITICAL: OPENAI_API_KEY environment variable not set at application startup.")
 if not SMTP_USERNAME or not SMTP_PASSWORD:
-    logging.warning("SMTP_USERNAME or SMTP_PASSWORD environment variable not set. Email sending may fail.")
+    logging.warning("SMTP_USERNAME or SMTP_PASSWORD environment variable not set at startup. Email sending may fail.")
 
 # Initialize OpenAI client
+client = None # Initialize client to None
 try:
     if OPENAI_API_KEY:
         client = OpenAI(api_key=OPENAI_API_KEY)
-        logging.info("OpenAI client initialized successfully.")
+        logging.info("OpenAI client initialized successfully during application startup.")
     else:
-        client = None
-        logging.error("OpenAI client NOT initialized due to missing API key.")
+        # This log is already covered by the check above, but kept for explicitness if OPENAI_API_KEY becomes falsey later
+        logging.error("OpenAI client NOT initialized at startup due to missing API key (OPENAI_API_KEY is not set).")
 except Exception as e:
-    logging.error(f"Failed to initialize OpenAI client: {e}")
-    logging.error(traceback.format_exc())
-    client = None # Ensure client is None if initialization fails
-
+    logging.error(f"Failed to initialize OpenAI client during application startup: {e}")
+    logging.error(traceback.format_exc()) # This will log the full traceback, e.g., for the 'proxies' error
+    # client remains None
+    
 # ------------------------------------------------------------------
 # Helper: Send email
 # ------------------------------------------------------------------
@@ -57,10 +56,16 @@ def send_email(subject: str, body: str):
         logging.error("SMTP credentials or server not configured. Cannot send email.")
         return
 
+    # Use the globally defined ADMIN_EMAIL
+    recipient_email = ADMIN_EMAIL
+    if not recipient_email:
+        logging.error("ADMIN_EMAIL is not configured. Cannot send email.")
+        return
+
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"]    = f"Sol Voice Assistant <no-reply@northernskindoctors.com.au>"
-    msg["To"]      = ADMIN_EMAIL
+    msg["From"]    = f"Sol Voice Assistant <no-reply@northernskindoctors.com.au>" # Or your desired 'From' email
+    msg["To"]      = recipient_email
     msg.set_content(body)
 
     try:
@@ -68,9 +73,9 @@ def send_email(subject: str, body: str):
             smtp.starttls() # Secure the connection
             smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(msg)
-        logging.info(f"Email sent successfully to {ADMIN_EMAIL} with subject: {subject}")
+        logging.info(f"Email sent successfully to {recipient_email} with subject: {subject}")
     except Exception as e:
-        logging.error(f"Failed to send email: {e}")
+        logging.error(f"Failed to send email to {recipient_email}: {e}")
         logging.error(traceback.format_exc())
 
 # ------------------------------------------------------------------
@@ -121,16 +126,17 @@ def voice_webhook():
     if speech_result:
         messages.append({"role": "user", "content": speech_result})
 
+    # Default reply in case of issues before OpenAI call
     assistant_reply = "Sorry, I encountered an issue processing your request. I'll notify the team."
 
-    if not client:
+    if not client: # Check if the global client object is None
         logging.error("OpenAI client is not initialized. Cannot process request to OpenAI.")
-        # The default assistant_reply will be used.
-        # Optionally, send an email here if this state is reached.
+        # Email is sent to notify admin about this critical issue
         send_email(
             subject=f"[Sol Critical Error] OpenAI Client Not Initialized - Call {call_sid}",
-            body=f"Attempted to process a request, but OpenAI client is not initialized.\nCaller said: {speech_result}"
+            body=f"Attempted to process a request, but OpenAI client is not initialized (client is None).\nCaller said: {speech_result}"
         )
+        # The default 'assistant_reply' will be used
     else:
         try:
             logging.info(f"Sending messages to OpenAI: {messages}")
@@ -157,18 +163,20 @@ def voice_webhook():
         logging.info(f"Emergency detected in reply. Saying: '{assistant_reply}' and ending interaction.")
         return Response(str(vr), mimetype="text/xml")
 
+    # Fallback check - also check generic error messages we might set
     if "didn’t quite catch that" in assistant_reply.lower() or \
        "sorry, something went wrong" in assistant_reply.lower() or \
-       "sorry, I encountered an issue" in assistant_reply.lower(): # Catching our own error messages
-        logging.info(f"Fallback or error condition detected. Sending email for CallSid: {call_sid}")
-        send_email(
-            subject=f"[NthSkinDocs] Fallback/Error from call {call_sid}",
-            body=f"Caller said: {speech_result}\nAssistant reply: {assistant_reply}"
-        )
+       "sorry, I encountered an issue" in assistant_reply.lower():
+        logging.info(f"Fallback or error condition response. Sending email for CallSid: {call_sid} with reply: {assistant_reply}")
+        # Check if an email was already sent for "client not initialized" to avoid duplicate generic emails
+        # This is a simple check; more sophisticated state might be needed for complex scenarios
+        if not ("OpenAI client is not initialized" in assistant_reply and not client) : # Avoid re-emailing for client init if already done
+             send_email(
+                subject=f"[NthSkinDocs] Fallback/Error from call {call_sid}",
+                body=f"Caller said: {speech_result}\nAssistant reply: {assistant_reply}"
+            )
 
     vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
-    # Note on voice: Ensure "Polly.Brian" is available in your Twilio account.
-    # Standard Twilio voices include "alice", "man", "woman". "en-AU" is a valid language.
     gather = Gather(
         input="speech",
         action="/voice",
@@ -182,14 +190,11 @@ def voice_webhook():
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Run server locally (for development) or for hosting platforms
+# Run server
 # ------------------------------------------------------------------
 if __name__ == "__main__":
-    # For production, ensure DEBUG is False.
-    # Hosting platforms like Render often set the PORT environment variable.
     port = int(os.environ.get("PORT", 5000))
-    # When deploying to Render or similar, they often use their own command
-    # (e.g., gunicorn app:app or what's in your Procfile/Start Command).
-    # This app.run() is mainly for local development or simple deployments.
-    # Set debug=False for any production or publicly accessible instance.
+    # For production on Render, use a Start Command like: gunicorn app:app
+    # The app.run below is primarily for local development.
+    # Ensure debug=False for any production or publicly accessible instance.
     app.run(host="0.0.0.0", port=port, debug=False)
