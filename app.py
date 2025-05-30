@@ -67,7 +67,9 @@ Call‑flow summary:
 # Flask application
 # ------------------------------------------------------------------
 app = Flask(__name__)
-
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ Sol is alive and ready. Use /voice for calls.", 200
 @app.route("/voice", methods=["POST"])
 def voice_webhook():
     """
