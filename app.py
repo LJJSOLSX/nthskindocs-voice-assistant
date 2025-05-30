@@ -6,13 +6,13 @@ Flask + Twilio + OpenAI GPT-4o
 import os
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
-from openai import OpenAI
+import openai
 import smtplib
 from email.message import EmailMessage
 import traceback
 
 # ------------------------------------------------------------------
-# Configuration (from environment variables)
+# Configuration
 # ------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@northernskindoctors.com.au")
@@ -21,13 +21,15 @@ SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
+openai.api_key = OPENAI_API_KEY  # ✅ legacy SDK-compatible
+
 # ------------------------------------------------------------------
-# Helper: Send email via SendGrid SMTP using domain-authenticated sender
+# Email helper
 # ------------------------------------------------------------------
 def send_email(subject: str, body: str):
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"]    = "no-reply@northernskindoctors.com.au"  # domain-authenticated
+    msg["From"]    = "no-reply@northernskindoctors.com.au"
     msg["To"]      = ADMIN_EMAIL
     msg.set_content(body)
 
@@ -37,7 +39,7 @@ def send_email(subject: str, body: str):
         smtp.send_message(msg)
 
 # ------------------------------------------------------------------
-# GPT-4o system prompt
+# GPT Prompt
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """You are Sol, the warm, friendly virtual receptionist \
 for Northern Skin Doctors (NthSkinDocs). \
@@ -63,7 +65,7 @@ Call-flow summary:
 """
 
 # ------------------------------------------------------------------
-# Flask application + routes
+# Flask app
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -76,15 +78,12 @@ def voice_webhook():
     speech_result = request.values.get("SpeechResult", "").strip()
     call_sid      = request.values.get("CallSid")
 
-    # Build conversation
     conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
     if speech_result:
         conversation.append({"role": "user", "content": speech_result})
 
-    # GPT-4o call
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-4o",
             messages=conversation,
             temperature=0.3,
@@ -95,20 +94,17 @@ def voice_webhook():
         assistant_reply = "Sorry, something went wrong. I’ll send your message to the team."
         send_email("Sol Error", str(e))
 
-    # Emergency path
     if "000" in assistant_reply or "hang up" in assistant_reply.lower():
         vr = VoiceResponse()
         vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
         return Response(str(vr), mimetype="text/xml")
 
-    # Fallback path
     if "didn’t quite catch" in assistant_reply.lower():
         send_email(
             subject=f"[NthSkinDocs] Fallback from call {call_sid}",
             body=f"Caller said: {speech_result}\nAssistant reply: {assistant_reply}"
         )
 
-    # Normal flow
     vr = VoiceResponse()
     vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
     gather = Gather(
@@ -122,8 +118,7 @@ def voice_webhook():
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Run local server
+# Local debug
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-```
