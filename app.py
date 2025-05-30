@@ -1,6 +1,6 @@
 """
 Northern Skin Doctors – Voice Assistant (Sol)
-Flask + Twilio + OpenAI GPT-4o
+Flask + Twilio + OpenAI GPT-4o (new SDK v1.x)
 """
 
 import os
@@ -10,10 +10,12 @@ from email.message import EmailMessage
 
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
-import openai
+
+# import the new OpenAI client
+from openai import OpenAI
 
 # ------------------------------------------------------------------
-# Configuration
+# Configuration (from ENV)
 # ------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@northernskindoctors.com.au")
@@ -22,11 +24,11 @@ SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
-# Set the API key for the old v0.x SDK style
-openai.api_key = OPENAI_API_KEY
+# instantiate the new client; it auto-reads OPENAI_API_KEY
+client = OpenAI()
 
 # ------------------------------------------------------------------
-# Helper: Send email
+# Helper: send email via SMTP (e.g. SendGrid)
 # ------------------------------------------------------------------
 def send_email(subject: str, body: str):
     msg = EmailMessage()
@@ -41,7 +43,7 @@ def send_email(subject: str, body: str):
         smtp.send_message(msg)
 
 # ------------------------------------------------------------------
-# GPT-4o Prompt Template
+# GPT-4o system prompt
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """You are Sol, the warm, friendly virtual receptionist \
 for Northern Skin Doctors (NthSkinDocs). \
@@ -67,7 +69,7 @@ Call-flow summary:
 """
 
 # ------------------------------------------------------------------
-# Flask application
+# Flask setup
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -80,18 +82,18 @@ def voice_webhook():
     speech_result = request.values.get("SpeechResult", "").strip()
     call_sid      = request.values.get("CallSid", "")
 
-    # Build the chat history
-    conversation = [
+    # build the messages list
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
     if speech_result:
-        conversation.append({"role": "user", "content": speech_result})
+        messages.append({"role": "user", "content": speech_result})
 
     try:
-        # Legacy SDK call
-        resp = openai.ChatCompletion.create(
+        # new SDK v1 syntax
+        resp = client.chat.completions.create(
             model="gpt-4o",
-            messages=conversation,
+            messages=messages,
             temperature=0.3,
         )
         assistant_reply = resp.choices[0].message.content
@@ -100,20 +102,20 @@ def voice_webhook():
         assistant_reply = "Sorry, something went wrong. I’ll send your message to the team."
         send_email("Sol Error", str(e))
 
-    # Emergency handling
+    # emergency handling
     if "000" in assistant_reply or "hang up" in assistant_reply.lower():
         vr = VoiceResponse()
         vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
         return Response(str(vr), mimetype="text/xml")
 
-    # Fallback logging
+    # fallback / unclear: email transcript
     if "didn’t quite catch" in assistant_reply.lower():
         send_email(
             subject=f"[NthSkinDocs] Fallback from call {call_sid}",
             body=f"Caller said: {speech_result}\nAssistant reply: {assistant_reply}"
         )
 
-    # Continue call
+    # continue the conversation
     vr = VoiceResponse()
     vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
     gather = Gather(
@@ -127,7 +129,7 @@ def voice_webhook():
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Local debug
+# Run locally for debugging
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
