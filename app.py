@@ -18,15 +18,15 @@ ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@northernskindoctors.com.au")
 SMTP_SERVER    = os.getenv("SMTP_SERVER", "smtp.sendgrid.net")
 SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME  = os.getenv("SMTP_USERNAME")   # your SendGrid “apikey” user
-SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")   # your actual SG API key
+SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")   # your SendGrid API key
 
 # ------------------------------------------------------------------
-# Helper: Send email via SendGrid SMTP using your verified Gmail
+# Helper: Send email via SendGrid SMTP using your authenticated domain
 # ------------------------------------------------------------------
 def send_email(subject: str, body: str):
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"]    = "drleejasonjones@gmail.com"  # ← your verified Single-Sender
+    msg["From"]    = "no-reply@northernskindoctors.com.au"  # now domain-authenticated
     msg["To"]      = ADMIN_EMAIL
     msg.set_content(body)
 
@@ -62,7 +62,7 @@ Call-flow summary:
 """
 
 # ------------------------------------------------------------------
-# Flask app + routes
+# Flask application + routes
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -75,7 +75,7 @@ def voice_webhook():
     speech_result = request.values.get("SpeechResult", "").strip()
     call_sid      = request.values.get("CallSid")
 
-    # Build GPT conversation
+    # Build conversation for GPT-4o
     conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
     if speech_result:
         conversation.append({"role": "user", "content": speech_result})
@@ -93,20 +93,20 @@ def voice_webhook():
         assistant_reply = "Sorry, something went wrong. I’ll send your message to the team."
         send_email("Sol Error", str(e))
 
-    # Emergency: end call immediately
+    # Emergency handling: hang up
     if "000" in assistant_reply or "hang up" in assistant_reply.lower():
         vr = VoiceResponse()
         vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
         return Response(str(vr), mimetype="text/xml")
 
-    # Fallback: send an email alert
+    # Fallback: unclear speech
     if "didn’t quite catch" in assistant_reply.lower():
         send_email(
             subject=f"[NthSkinDocs] Fallback from call {call_sid}",
             body=f"Caller said: {speech_result}\nAssistant reply: {assistant_reply}"
         )
 
-    # Normal flow: speak & gather next utterance
+    # Normal flow: speak and gather
     vr = VoiceResponse()
     vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
     gather = Gather(
@@ -120,7 +120,7 @@ def voice_webhook():
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Run locally (debug)
+# Run local server (debug mode)
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
