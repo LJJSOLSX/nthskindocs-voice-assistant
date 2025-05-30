@@ -21,12 +21,12 @@ SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
 # ------------------------------------------------------------------
-# Helper: Send email using SMTP
+# Helper: Send email via SendGrid SMTP using verified Gmail sender
 # ------------------------------------------------------------------
 def send_email(subject: str, body: str):
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"]    = SMTP_USERNAME  # ✅ verified SendGrid sender
+    msg["From"]    = "drleejasonjones@gmail.com"  # ✅ verified sender
     msg["To"]      = ADMIN_EMAIL
     msg.set_content(body)
 
@@ -37,7 +37,7 @@ def send_email(subject: str, body: str):
         smtp.send_message(msg)
 
 # ------------------------------------------------------------------
-# GPT-4o system prompt
+# GPT‑4o system prompt
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """You are Sol, the warm, friendly virtual receptionist \
 for Northern Skin Doctors (NthSkinDocs). \
@@ -116,7 +116,7 @@ def voice_webhook():
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Run local server (used only when testing manually)
+# Run server (Render handles this automatically)
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
