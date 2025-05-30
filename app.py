@@ -18,11 +18,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@northernskindoctors.com.au")
 SMTP_SERVER    = os.getenv("SMTP_SERVER", "smtp.sendgrid.net")
 SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME  = os.getenv("SMTP_USERNAME")   # your SendGrid "apikey" user
-SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")   # your SendGrid API key
+SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
 # ------------------------------------------------------------------
-# Helper: Send email via SendGrid SMTP using your authenticated domain
+# Helper: Send email via SendGrid SMTP using domain-authenticated sender
 # ------------------------------------------------------------------
 def send_email(subject: str, body: str):
     msg = EmailMessage()
@@ -91,7 +91,6 @@ def voice_webhook():
         )
         assistant_reply = response.choices[0].message.content
     except Exception as e:
-        # Print full traceback to logs
         traceback.print_exc()
         assistant_reply = "Sorry, something went wrong. I’ll send your message to the team."
         send_email("Sol Error", str(e))
@@ -127,3 +126,4 @@ def voice_webhook():
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+```
