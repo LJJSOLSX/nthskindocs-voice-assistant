@@ -1,6 +1,6 @@
 """
-Sol Voice Assistant - Natural GPT-4o-Powered Clinic Receptionist
-Version: v2.1 (with startup and client initialization fixes)
+Sol Voice Assistant - GPT-4o-Powered Natural Receptionist
+Version: v2.6 (cleaned and improved)
 """
 
 import os
@@ -43,10 +43,10 @@ try:
         client = OpenAI(api_key=OPENAI_API_KEY)
         logging.info("OpenAI client initialized successfully at startup.")
     else:
-        # This case is logged above, but client remains None.
+        # This case is logged by the check above, client remains None.
         logging.error("OpenAI client not initialized at startup because OPENAI_API_KEY was not found in environment.")
 except Exception as e:
-    logging.error("CRITICAL STARTUP ERROR: Failed to initialize OpenAI client:", exc_info=True)
+    logging.error("CRITICAL STARTUP ERROR: Failed to initialize OpenAI client (e.g., invalid key, network issue):", exc_info=True)
     # client remains None, the error and traceback are logged.
 
 # ------------------------------------------------------------------
@@ -56,119 +56,119 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Sol is live and running."
+    return "✅ Sol is live (v2.6 - stateless)."
 
 @app.route("/voice", methods=["POST"])
 def voice():
     speech_result = request.values.get("SpeechResult", "").strip()
     call_sid = request.values.get("CallSid", "UnknownCallSid")
-    logging.info(f"Incoming call {call_sid} to /voice. SpeechResult: '{speech_result}'")
+    logging.info(f"Call {call_sid} — User said: '{speech_result}'")
 
     # CRITICAL: Check if OpenAI client was initialized successfully at startup
     if not client:
-        logging.error(f"OpenAI client is not available for CallSid {call_sid} (was not initialized at startup). Cannot process OpenAI request.")
-        reply_text = "I am currently experiencing a system configuration issue and cannot assist fully right now. The team has been notified."
-        
-        # Attempt to send an email about this critical failure
-        send_email(
-            subject=f"[Sol Critical System Error] OpenAI Client Not Initialized - Call {call_sid}",
-            body=(
-                f"CallSid: {call_sid}\n"
-                f"Caller said: {speech_result}\n\n"
-                "Attempted to process a voice request, but the OpenAI client is not available. "
-                "This usually means it failed to initialize when the application started, "
-                "likely due to an issue with the OPENAI_API_KEY or a network problem preventing connection to OpenAI at startup."
-            )
-        )
-        
-        vr_error = VoiceResponse()
-        vr_error.say(reply_text, voice="Polly.Brian", language="en-AU")
-        # Consider vr_error.hangup() here if no further interaction is possible
-        return Response(str(vr_error), mimetype="text/xml")
+        error_message_for_log = "OpenAI client is not available (was not initialized at startup)."
+        logging.error(f"{error_message_for_log} Cannot process OpenAI request for CallSid {call_sid}.")
+        notify_error(call_sid, speech_result, error_message_for_log)
+        # Use the 'say' helper to respond and end the call as system is misconfigured
+        return say("I'm having trouble connecting to my thinking process right now. The team has been notified and will follow up with you shortly if needed.")
 
     # If client is initialized, proceed with normal logic
     system_prompt = """
-    You are Sol, the warm, intelligent virtual receptionist for Northern Skin Doctors.
-    You sound human — friendly, calm, and professional (like Brian from ElevenLabs).
-    Speak naturally. You help with skin check bookings, cosmetic enquiries, laser treatments, and results. 
-    Ask clarifying questions if unsure, and always sound caring.
-    Never fall back unless the user says something completely irrelevant.
+    You are Sol, the intelligent and emotionally aware voice assistant for Northern Skin Doctors.
+    You are calm, confident, and kind — never robotic. Speak like a human.
+    Always acknowledge the caller naturally. Use warmth and helpfulness.
 
-    If a caller wants to book, ask what type: skin check, cosmetic, or laser. Then ask for name, phone, and preferred day.
-    If they want results, say: "I'll alert the team, we don’t give results over the phone."
-    If they want to cancel, ask their name and date of appointment.
-    If it's an emergency, say: "Please hang up and call 000 immediately."
-    If they want to speak to someone, say: "I'll pass this to a team member."
-    Finish each request by saying: "Thanks, I’ll pass this along to the team to confirm by SMS."
+    - When someone says "I want to book a skin check", reply warmly: "Absolutely, happy to help with that — do you have a day in mind?"
+    - If they say something vague like "I'm calling about my results", reply: "Of course — I’ll alert the team. We don’t give results over the phone."
+    - If unsure what they mean, gently clarify.
+    - Never say “I’m confused.” Never say “I’m a bot.” Never default to fallback unless you truly don’t understand.
+
+    You can:
+    - Book appointments (ask what type, name, phone, date)
+    - Cancel appointments (ask name and date)
+    - Handle laser enquiries ($250 out of pocket)
+    - Explain FotoFinder ($200 for full-body AI skin check)
+    - Deflect results requests (team will follow up)
+    - Flag emergencies (say: “Please hang up and call 000 immediately.”)
+
+    Finish helpful responses with: “I’ll pass this to the team to confirm by SMS. Thanks!”
     """
-
+    # Note: Implementing true multi-turn memory robustly requires storing conversation history,
+    # e.g., using a session or database, or carefully managing state via URL parameters.
+    # This version is stateless turn-by-turn.
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": speech_result if speech_result else "Hello"} # Send "Hello" if speech_result is empty for initial greeting
+        {"role": "user", "content": speech_result or "Hello"} # Send "Hello" if speech_result is empty for initial greeting
     ]
 
+    reply_text = "Sorry, something went wrong. I’ll send your message to the team." # Default reply
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            temperature=0.3
+            temperature=0.4 # User's preferred temperature
         )
         reply_text = response.choices[0].message.content.strip()
-        logging.info(f"Sol reply for {call_sid}: {reply_text}")
+        logging.info(f"Sol says for {call_sid}: '{reply_text}'")
     except Exception as e:
         logging.error(f"Error calling OpenAI for CallSid {call_sid}:", exc_info=True)
-        reply_text = "Sorry, something went wrong while I was trying to understand that. I'll notify the team."
-        send_email(
-            subject=f"[Sol OpenAI API Error] Call {call_sid}",
-            body=(
-                f"CallSid: {call_sid}\n"
-                f"Caller said: {speech_result}\n\n"
-                f"An error occurred while calling the OpenAI API:\n{traceback.format_exc()}"
-            )
-        )
+        # reply_text is already set to a default error message
+        notify_error(call_sid, speech_result, traceback.format_exc())
+
 
     # Twilio VoiceResponse
     vr = VoiceResponse()
     vr.say(reply_text, voice="Polly.Brian", language="en-AU") # Ensure Polly.Brian is configured in Twilio
     
-    # Only gather if it's not an emergency message
-    if not ("hang up and call 000" in reply_text):
+    # Only gather further input if it's not an emergency message directing to call 000
+    if not ("hang up and call 000" in reply_text.lower()):
         gather = Gather(
             input="speech",
-            action="/voice",
+            action="/voice", # Loop back to this endpoint for the next turn
             method="POST",
-            timeout=5, # Seconds to wait for speech
+            timeout=5,        # Seconds to wait for user speech
             speechTimeout="auto" # Let Twilio determine end of speech based on silence
         )
+        # No extra <Say> prompts within Gather for a cleaner experience.
+        # The assistant's main reply should naturally lead the user to speak.
         vr.append(gather)
     else:
         logging.info(f"Emergency message detected for {call_sid}. Not gathering further input.")
-        # vr.hangup() # Optionally explicitly hang up after an emergency message
+        # vr.hangup() # Optional: explicitly hang up after an emergency message
 
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Email Notification
+# Email Error Notification Helper
 # ------------------------------------------------------------------
-def send_email(subject, body):
-    if not (SMTP_USERNAME and SMTP_PASSWORD and SMTP_SERVER and ADMIN_EMAIL): # Added ADMIN_EMAIL check
-        logging.error("Missing SMTP credentials or ADMIN_EMAIL. Email not sent. Subject: " + subject)
+def notify_error(call_sid, user_input, error_details):
+    if not (SMTP_SERVER and SMTP_PORT and SMTP_USERNAME and SMTP_PASSWORD and ADMIN_EMAIL):
+        logging.error(f"SMTP settings or ADMIN_EMAIL missing. Cannot send error email for CallSid {call_sid}.")
         return
-
+    
     msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = "Sol Voice Assistant <no-reply@northernskindoctors.com.au>" # Consider making From email configurable
+    msg["Subject"] = f"[Sol Voice Assistant Error] Call {call_sid}"
+    msg["From"] = "Sol AI Assistant <no-reply@northernskindoctors.com.au>" # Consider making From email configurable
     msg["To"] = ADMIN_EMAIL
-    msg.set_content(body)
-
+    msg.set_content(f"An error occurred with the Sol Voice Assistant.\n\nCallSid: {call_sid}\nUser said: '{user_input}'\n\nError Details:\n{error_details}")
+    
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
             smtp.starttls()
             smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(msg)
-        logging.info(f"Email sent to {ADMIN_EMAIL} with subject: {subject}")
+        logging.info(f"Error notification email sent successfully for CallSid {call_sid} to {ADMIN_EMAIL}.")
     except Exception as e:
-        logging.error(f"Failed to send email for subject '{subject}':", exc_info=True)
+        logging.error(f"Failed to send error notification email for CallSid {call_sid}:", exc_info=True)
+
+# ------------------------------------------------------------------
+# Simple TwiML Response Helper (for messages without Gather)
+# ------------------------------------------------------------------
+def say(text_to_say):
+    vr = VoiceResponse()
+    vr.say(text_to_say, voice="Polly.Brian", language="en-AU")
+    # This response does not include a Gather, so the call may end after this.
+    return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
 # Run the App (Primarily for local development)
@@ -177,5 +177,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     # For Render, ensure your Start Command uses a production WSGI server like Gunicorn (e.g., gunicorn app:app)
     # debug=True can be useful for local testing but MUST be False in production.
-    use_debug_mode = os.getenv("FLASK_DEBUG", "False").lower() == "true"
+    use_debug_mode = os.getenv("FLASK_DEBUG", "False").lower() == "true" # e.g., set FLASK_DEBUG=true in env for local
     app.run(host="0.0.0.0", port=port, debug=use_debug_mode)
