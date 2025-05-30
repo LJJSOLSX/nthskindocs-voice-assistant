@@ -11,32 +11,33 @@ import smtplib
 from email.message import EmailMessage
 
 # ------------------------------------------------------------------
-# Configuration (pulled from environment variables)
+# Configuration (from environment variables)
 # ------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@northernskindoctors.com.au")
-SMTP_SERVER    = os.getenv("SMTP_SERVER", "localhost")
-SMTP_PORT      = int(os.getenv("SMTP_PORT", "25"))
+SMTP_SERVER    = os.getenv("SMTP_SERVER", "smtp.sendgrid.net")
+SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
 SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
 
 # ------------------------------------------------------------------
-# Helper: Send email (via SendGrid or SMTP)
+# Helper: Send email using SMTP
 # ------------------------------------------------------------------
 def send_email(subject: str, body: str):
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"]    = SMTP_USERNAME  # ✅ use your verified SendGrid user
+    msg["From"]    = SMTP_USERNAME  # ✅ verified SendGrid sender
     msg["To"]      = ADMIN_EMAIL
     msg.set_content(body)
 
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp:
+        smtp.starttls()
         if SMTP_USERNAME:
             smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
         smtp.send_message(msg)
 
 # ------------------------------------------------------------------
-# GPT‑4o system prompt
+# GPT-4o system prompt
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """You are Sol, the warm, friendly virtual receptionist \
 for Northern Skin Doctors (NthSkinDocs). \
@@ -62,7 +63,7 @@ Call‑flow summary:
 """
 
 # ------------------------------------------------------------------
-# Flask app + routes
+# Flask app
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -75,14 +76,10 @@ def voice_webhook():
     speech_result = request.values.get("SpeechResult", "").strip()
     call_sid      = request.values.get("CallSid")
 
-    # Construct conversation
-    conversation = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-    ]
+    conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
     if speech_result:
         conversation.append({"role": "user", "content": speech_result})
 
-    # Call GPT-4o
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
         response = client.chat.completions.create(
@@ -95,20 +92,17 @@ def voice_webhook():
         assistant_reply = "Sorry, something went wrong. I’ll send your message to the team."
         send_email("Sol Error", str(e))
 
-    # Emergency handling
     if "000" in assistant_reply or "hang up" in assistant_reply.lower():
         vr = VoiceResponse()
         vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
         return Response(str(vr), mimetype="text/xml")
 
-    # Fallback handling
     if "didn’t quite catch" in assistant_reply.lower():
         send_email(
             subject=f"[NthSkinDocs] Fallback from call {call_sid}",
             body=f"Caller said: {speech_result}\nAssistant reply: {assistant_reply}"
         )
 
-    # Continue conversation
     vr = VoiceResponse()
     vr.say(assistant_reply, voice="Polly.Brian", language="en-AU")
     gather = Gather(
@@ -122,7 +116,7 @@ def voice_webhook():
     return Response(str(vr), mimetype="text/xml")
 
 # ------------------------------------------------------------------
-# Entry
+# Run local server (used only when testing manually)
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
