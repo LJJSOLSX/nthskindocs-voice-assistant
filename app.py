@@ -1,6 +1,6 @@
 """
 Sol Voice Assistant - GPT-4o + Whisper STT + ElevenLabs TTS
-Version: v3.5.2 (Fixed f-string SyntaxError for logging)
+Version: v3.6.0 (Added Test Endpoint & Unified Prompt)
 """
 
 import os
@@ -8,7 +8,7 @@ import traceback
 import logging
 import smtplib
 from email.message import EmailMessage
-from flask import Flask, request, Response, send_from_directory
+from flask import Flask, request, Response, send_from_directory # Added request here
 from twilio.twiml.voice_response import VoiceResponse, Play, Record
 from openai import OpenAI
 import uuid
@@ -79,13 +79,27 @@ except OSError as e:
     logging.error(f"CRITICAL STARTUP ERROR: Could not create audio directory '{TEMP_AUDIO_DIR_PATH}': {e}")
 
 # ------------------------------------------------------------------
-# Flask App
+# Global System Prompt
+# ------------------------------------------------------------------
+SYSTEM_PROMPT = """
+You are Sol, the emotionally intelligent AI receptionist for Northern Skin Doctors. 
+You sound like a real person — warm, thoughtful, and precise. Never robotic.
+- Always respond clearly and helpfully.
+- If the caller wants to book, always ask for type of appointment, name, and preferred date.
+- Never say you are an AI. Never say you’re confused.
+- Always ask follow-up questions to keep the conversation flowing naturally unless the user explicitly says they are done or hangs up.
+- End helpful responses (like after taking booking details or answering a query) with: 'I'll pass this to the team to confirm by SMS. Thanks!'
+"""
+# Specific examples from your test prompt can be further integrated here or handled by GPT's general understanding.
+
+# ------------------------------------------------------------------
+# Flask App Setup
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Sol Voice v3.5.2 is live (SyntaxError Fix)."
+    return "✅ Sol Voice v3.6.0 is live (Added Test Endpoint & Unified Prompt)."
 
 @app.route(f"/{TEMP_AUDIO_DIR_NAME}/<path:filename>")
 def serve_audio(filename):
@@ -101,6 +115,7 @@ def serve_audio(filename):
 
 # --- Text-to-Speech (ElevenLabs) Helper ---
 def text_to_elevenlabs_audio(text_to_speak, call_sid_for_log=""):
+    # (This function remains the same as in v3.5.2 - includes byte checking & robust error handling)
     if not (ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID):
         logging.warning(f"Call {call_sid_for_log}: ElevenLabs API key or Voice ID missing. Cannot generate custom audio.")
         return None, text_to_speak
@@ -194,38 +209,27 @@ def handle_speech_input():
             transcript_response = client.audio.transcriptions.create(model="whisper-1", file=audio_content)
             speech_result = transcript_response.text.strip()
             logging.info(f"Call {call_sid}: Whisper transcript: '{speech_result}'")
-        except requests.exceptions.HTTPError as http_err:
+        except requests.exceptions.HTTPError as http_err: # Error downloading audio
             logging.error(f"Call {call_sid}: Failed Twilio audio download: {http_err.response.status_code} - {http_err.response.text[:200]}", exc_info=True)
             notify_error(call_sid, f"RecURL: {recording_url}", f"Twilio Audio DL HTTP Err: {http_err.response.status_code}")
             return say_fallback_with_gather("I had trouble retrieving what you said. Could you please repeat that?")
-        except requests.exceptions.RequestException as req_err:
+        except requests.exceptions.RequestException as req_err: # Other network errors for download
             logging.error(f"Call {call_sid}: Failed Twilio audio download (Net): {req_err}", exc_info=True)
             notify_error(call_sid, f"RecURL: {recording_url}", f"Twilio Audio DL Net Err: {req_err}")
             return say_fallback_with_gather("Couldn't get what you said due to a network hiccup. Please say it again.")
-        except Exception as e:
+        except Exception as e: # Catch OpenAI errors during transcription or other issues
             logging.error(f"Call {call_sid}: Whisper transcription/audio handling error: {e}", exc_info=True)
             notify_error(call_sid, f"RecURL: {recording_url}", f"Whisper/Audio Err: {e}")
             return say_fallback_with_gather("I had a bit of trouble understanding that. Could you say it again?")
     elif recording_duration == 0: logging.info(f"Call {call_sid}: No speech detected (0s duration)."); speech_result = ""
     else: logging.warning(f"Call {call_sid}: No RecordingUrl. Duration: {recording_duration}s."); speech_result = ""
     
-    system_prompt = """
-    You are Sol, the emotionally intelligent AI receptionist for Northern Skin Doctors. 
-    You sound like a real person — warm, thoughtful, and precise. Never robotic.
-    - Always respond clearly and helpfully.
-    - If the caller wants to book, always ask for type of appointment, name, and preferred date.
-    - Never say you are an AI. Never say you’re confused.
-    - Do not end the conversation without follow-up unless the caller explicitly says they are done or hangs up.
-    - End helpful responses with: 'I'll pass this to the team to confirm by SMS. Thanks!'
-    """
-    
-    # *** SYNTAX ERROR FIX APPLIED HERE ***
-    user_message_for_gpt = speech_result or "Is anyone there?" # Prepare the message content
-    logging.info(f"Call {call_sid}: Sending to OpenAI GPT-4o: '{user_message_for_gpt}'") # Log it cleanly
+    user_message_for_gpt = speech_result or "Is anyone there?"
+    logging.info(f"Call {call_sid}: Sending to OpenAI GPT-4o: '{user_message_for_gpt}'")
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message_for_gpt} # Use the prepared message
+        {"role": "system", "content": SYSTEM_PROMPT}, # Using global SYSTEM_PROMPT
+        {"role": "user", "content": user_message_for_gpt}
     ]
     
     gpt_reply_text = "I'm sorry, I'm having a little trouble formulating a response. Please try again shortly."
@@ -250,14 +254,68 @@ def handle_speech_input():
     twiml_to_send = str(vr); logging.info(f"Call {call_sid}: Responding from /handle_speech_input with TwiML: {twiml_to_send}"); return Response(twiml_to_send, mimetype="text/xml")
 
 # ------------------------------------------------------------------
+# Test Transcript Endpoint (NEW)
+# ------------------------------------------------------------------
+@app.route("/test-transcript", methods=["GET"])
+def test_transcript():
+    input_text = request.args.get("text", "Hello this is a test booking a skin check for Thursday.")
+    call_sid = f"TEST-{uuid.uuid4().hex[:8]}" # Made test CallSid slightly longer
+    logging.info(f"[Test Mode /test-transcript] Simulating pipeline for text: '{input_text}' with CallSid: {call_sid}")
+
+    if not client:
+        logging.error("[Test Mode /test-transcript] OpenAI client is not initialized.")
+        return {"success": False, "error": "OpenAI client not initialized. Check server logs."}, 500
+
+    try:
+        # Use the global SYSTEM_PROMPT for consistency
+        messages_for_gpt = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": input_text}
+        ]
+        logging.info(f"[Test Mode /test-transcript] Sending to GPT-4o: {messages_for_gpt}")
+        gpt_response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages_for_gpt,
+            temperature=0.4 # Consistent with main voice logic
+        )
+        gpt_reply_text = gpt_response.choices[0].message.content.strip()
+        logging.info(f"[Test Mode /test-transcript] GPT-4o reply: '{gpt_reply_text}'")
+
+        # Generate audio using the existing helper
+        audio_url, fallback_text_if_audio_fails = text_to_elevenlabs_audio(gpt_reply_text, call_sid_for_log=call_sid)
+        
+        if audio_url:
+            logging.info(f"[Test Mode /test-transcript] Successfully generated audio URL: {audio_url}")
+            return {
+                "success": True,
+                "input_text": input_text,
+                "gpt_reply": gpt_reply_text,
+                "audio_url": audio_url,
+                "note": "You can play this audio_url in your browser."
+            }, 200
+        else:
+            logging.error(f"[Test Mode /test-transcript] Failed to generate audio for GPT reply: '{fallback_text_if_audio_fails}'. Polly would be used in a real call.")
+            return {
+                "success": False,
+                "input_text": input_text,
+                "gpt_reply": gpt_reply_text, # Still useful to see GPT's text response
+                "error": "Failed to generate ElevenLabs audio. Fallback to Polly would occur in a live call.",
+                "polly_would_say": fallback_text_if_audio_fails
+            }, 500 # Indicates an issue in the audio generation part of the test
+
+    except Exception as e:
+        logging.error(f"[Test Mode /test-transcript] General Error: {e}", exc_info=True)
+        return {"success": False, "error": str(e), "input_text": input_text}, 500
+
+# ------------------------------------------------------------------
 # Helper Functions (notify_error, say_fallback, say_fallback_with_gather)
 # ------------------------------------------------------------------
-def say_fallback(text_to_say):
+def say_fallback(text_to_say): # For critical errors, no gather
     logging.info(f"Using say_fallback (no gather) for: '{text_to_say[:80]}...'")
     vr = VoiceResponse(); vr.say(text_to_say, voice="Polly.Brian", language="en-AU")
     twiml_to_send = str(vr); logging.info(f"Fallback TwiML (no gather): {twiml_to_send}"); return Response(twiml_to_send, mimetype="text/xml")
 
-def say_fallback_with_gather(text_to_say):
+def say_fallback_with_gather(text_to_say): # For non-critical, continue with Record
     logging.info(f"Using say_fallback_with_gather for: '{text_to_say[:80]}...'")
     vr = VoiceResponse(); vr.say(text_to_say, voice="Polly.Brian", language="en-AU")
     if not ("hang up and call 000" in text_to_say.lower()):
