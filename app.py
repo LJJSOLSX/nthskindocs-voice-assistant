@@ -1,6 +1,6 @@
 """
 Sol Voice Assistant - GPT-4o + Whisper STT + ElevenLabs TTS
-Version: v3.6.2 (Enhanced Audio Download with Retry Logic and Recording Status Verification)
+Version: v3.6.4 (Complete Fixed Version)
 """
 
 import os
@@ -8,14 +8,14 @@ import traceback
 import logging
 import smtplib
 from email.message import EmailMessage
-from flask import Flask, request, Response, send_from_directory # Added request here
-from twilio.twiml.voice_response import VoiceResponse, Play, Record
+from flask import Flask, request, Response, send_from_directory
+from twilio.twiml.voice_response import VoiceResponse, Say, Record
 from twilio.rest import Client
 from openai import OpenAI
 import uuid
 import requests
 import time
-import io # For BytesIO
+import io
 
 # ------------------------------------------------------------------
 # Logging Configuration
@@ -27,72 +27,64 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "vVnXvLYPFjIyE2YrjUBE") # Default "Rachel"
-
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "vVnXvLYPFjIyE2YrjUBE")
 RENDER_APP_BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
-if RENDER_APP_BASE_URL:
-    AUDIO_HOST_URL = RENDER_APP_BASE_URL
-    logging.info(f"Using RENDER_EXTERNAL_URL for AUDIO_HOST_URL: {AUDIO_HOST_URL}")
-else:
-    AUDIO_HOST_URL = os.getenv("AUDIO_HOST_URL_MANUAL", "http://localhost:5000")
-    logging.warning(f"RENDER_EXTERNAL_URL not found. Using manual/default AUDIO_HOST_URL: {AUDIO_HOST_URL}")
-
-ADMIN_EMAIL    = os.getenv("ADMIN_EMAIL", "admin@northernskindoctors.com.au")
-SMTP_SERVER    = os.getenv("SMTP_SERVER", "smtp.sendgrid.net")
-SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME  = os.getenv("SMTP_USERNAME")
-SMTP_PASSWORD  = os.getenv("SMTP_PASSWORD")
-
+AUDIO_HOST_URL = RENDER_APP_BASE_URL or os.getenv("AUDIO_HOST_URL_MANUAL", "http://localhost:5000")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "manager@northernskindoctors.com.au")
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.sendgrid.net")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
-# Validate essential environment variables
+# ------------------------------------------------------------------
+# Environment Checks and Initialization
+# ------------------------------------------------------------------
 startup_warnings = []
-if not OPENAI_API_KEY: startup_warnings.append("CRITICAL STARTUP ERROR: OPENAI_API_KEY not set.")
-if not ELEVENLABS_API_KEY: startup_warnings.append("STARTUP WARNING: ELEVENLABS_API_KEY not set. ElevenLabs TTS will fail.")
-if not ADMIN_EMAIL: startup_warnings.append("STARTUP WARNING: ADMIN_EMAIL not set.")
-if not (SMTP_SERVER and SMTP_PORT and SMTP_USERNAME and SMTP_PASSWORD): startup_warnings.append("STARTUP WARNING: SMTP variables missing.")
-if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN): startup_warnings.append("STARTUP INFO: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN missing. Authenticated download of Twilio recordings may fail.")
+if not OPENAI_API_KEY: 
+    startup_warnings.append("CRITICAL STARTUP ERROR: OPENAI_API_KEY not set.")
+if not ELEVENLABS_API_KEY: 
+    startup_warnings.append("STARTUP WARNING: ELEVENLABS_API_KEY not set.")
+if not ADMIN_EMAIL: 
+    startup_warnings.append("STARTUP WARNING: ADMIN_EMAIL not set.")
+if not (SMTP_SERVER and SMTP_PORT and SMTP_USERNAME and SMTP_PASSWORD):
+    startup_warnings.append("STARTUP WARNING: SMTP variables missing.")
+if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+    startup_warnings.append("CRITICAL STARTUP ERROR: TWILIO credentials missing.")
 
 for warning in startup_warnings:
-    if "CRITICAL" in warning: logging.error(warning)
-    else: logging.warning(warning)
+    if "CRITICAL" in warning:
+        logging.error(warning)
+    else:
+        logging.warning(warning)
 
-# Initialize OpenAI client
+# Initialize clients
 client = None
-try:
-    if OPENAI_API_KEY:
+twilio_client = None
+
+if OPENAI_API_KEY:
+    try:
         client = OpenAI(api_key=OPENAI_API_KEY)
         logging.info("OpenAI client initialized successfully at startup.")
-    else:
-        logging.error("OpenAI client not initialized at startup: OPENAI_API_KEY missing.")
-except Exception as e:
-    logging.error("CRITICAL STARTUP ERROR: Failed to initialize OpenAI client:", exc_info=True)
+    except Exception as e:
+        logging.error(f"Failed to initialize OpenAI client: {e}")
 
-# Initialize Twilio client for recording verification
-twilio_client = None
-try:
-    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    try:
         twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         logging.info("Twilio client initialized successfully at startup.")
-    else:
-        logging.warning("Twilio client not initialized: credentials missing.")
-except Exception as e:
-    logging.error("Failed to initialize Twilio client:", exc_info=True)
+    except Exception as e:
+        logging.error(f"Failed to initialize Twilio client: {e}")
 
-# Temporary Audio File Setup
+# Audio directory setup
 TEMP_AUDIO_DIR_NAME = "temp_audio_files"
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 TEMP_AUDIO_DIR_PATH = os.path.join(BASE_DIR, TEMP_AUDIO_DIR_NAME)
-try:
-    os.makedirs(TEMP_AUDIO_DIR_PATH, exist_ok=True)
-    logging.info(f"Temporary audio directory ensured at: {TEMP_AUDIO_DIR_PATH}")
-except OSError as e:
-    logging.error(f"CRITICAL STARTUP ERROR: Could not create audio directory '{TEMP_AUDIO_DIR_PATH}': {e}")
+os.makedirs(TEMP_AUDIO_DIR_PATH, exist_ok=True)
+logging.info(f"Using RENDER_EXTERNAL_URL for AUDIO_HOST_URL: {AUDIO_HOST_URL}")
+logging.info(f"Temporary audio directory ensured at: {TEMP_AUDIO_DIR_PATH}")
 
-# ------------------------------------------------------------------
-# Global System Prompt
-# ------------------------------------------------------------------
 SYSTEM_PROMPT = """
 You are Sol, the emotionally intelligent AI receptionist for Northern Skin Doctors. 
 You sound like a real person — warm, thoughtful, and precise. Never robotic.
@@ -103,376 +95,325 @@ You sound like a real person — warm, thoughtful, and precise. Never robotic.
 - End helpful responses (like after taking booking details or answering a query) with: 'I'll pass this to the team to confirm by SMS. Thanks!'
 """
 
-# ------------------------------------------------------------------
-# Flask App Setup
-# ------------------------------------------------------------------
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
-def home():
-    return "✅ Sol Voice v3.6.2 is live (Enhanced Audio Download with Retry Logic)."
-
-@app.route(f"/{TEMP_AUDIO_DIR_NAME}/<path:filename>")
-def serve_audio(filename):
-    logging.info(f"Attempting to serve audio file: {filename} from {TEMP_AUDIO_DIR_PATH}")
-    try:
-        return send_from_directory(TEMP_AUDIO_DIR_PATH, os.path.basename(filename), as_attachment=False)
-    except FileNotFoundError:
-        logging.error(f"Audio file not found during serve_audio: {filename}")
-        return "File not found", 404
-    except Exception as e:
-        logging.error(f"Error serving audio file {filename}:", exc_info=True)
-        return "Error serving file", 500
-
 # ------------------------------------------------------------------
-# Enhanced Recording Download Functions
+# Utility Functions
 # ------------------------------------------------------------------
-def extract_recording_sid_from_url(recording_url):
-    """Extract recording SID from Twilio recording URL"""
-    try:
-        # URL format: https://api.twilio.com/2010-04-01/Accounts/{AccountSid}/Recordings/{RecordingSid}
-        parts = recording_url.split('/')
-        if 'Recordings' in parts:
-            recording_sid_index = parts.index('Recordings') + 1
-            if recording_sid_index < len(parts):
-                return parts[recording_sid_index].split('.')[0]  # Remove any file extension
-    except Exception as e:
-        logging.error(f"Failed to extract recording SID from URL {recording_url}: {e}")
-    return None
 
-def wait_for_recording_completion(recording_sid, call_sid, timeout=15):
-    """Wait for recording to be fully processed by Twilio"""
-    if not twilio_client:
-        logging.warning(f"Call {call_sid}: No Twilio client available for recording status check")
-        return False
+def send_error_email(call_sid, error_msg):
+    """Send error notification email to admin."""
+    if not all([SMTP_SERVER, SMTP_USERNAME, SMTP_PASSWORD, ADMIN_EMAIL]):
+        logging.warning("SMTP not configured, skipping error email.")
+        return
     
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            recording = twilio_client.recordings(recording_sid).fetch()
-            logging.info(f"Call {call_sid}: Recording {recording_sid} status: {recording.status}")
-            
-            if recording.status == 'completed':
-                return True
-            elif recording.status == 'failed':
-                logging.error(f"Call {call_sid}: Recording {recording_sid} failed")
-                return False
-                
-            time.sleep(1)  # Wait 1 second before checking again
-        except Exception as e:
-            logging.warning(f"Call {call_sid}: Error checking recording status: {e}")
-            time.sleep(1)
-    
-    logging.warning(f"Call {call_sid}: Timeout waiting for recording {recording_sid} completion")
-    return False
+    try:
+        msg = EmailMessage()
+        msg['Subject'] = f"Sol Voice Assistant Error - Call {call_sid}"
+        msg['From'] = SMTP_USERNAME
+        msg['To'] = ADMIN_EMAIL
+        msg.set_content(f"Error occurred in call {call_sid}:\n\n{error_msg}")
+        
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+        
+        logging.info(f"Error email sent for CallSid {call_sid} to {ADMIN_EMAIL}.")
+    except Exception as e:
+        logging.error(f"Failed to send error email: {e}")
 
 def download_recording_with_retry(recording_url, call_sid, max_retries=3, initial_delay=2):
-    """Download recording with exponential backoff retry logic"""
-    recording_sid = extract_recording_sid_from_url(recording_url)
-    
-    # First, wait for recording to be ready
-    if recording_sid and twilio_client:
-        logging.info(f"Call {call_sid}: Waiting for recording {recording_sid} to be ready")
-        if not wait_for_recording_completion(recording_sid, call_sid):
-            logging.warning(f"Call {call_sid}: Recording may not be ready, but proceeding with download attempts")
+    """Download Twilio recording with exponential backoff retry."""
+    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN):
+        logging.error(f"Call {call_sid}: Missing Twilio credentials for download")
+        return None
     
     delay = initial_delay
-    last_error = None
-    
     for attempt in range(max_retries):
-        logging.info(f"Call {call_sid}: Download attempt {attempt + 1}/{max_retries} after {delay}s delay")
-        
-        if attempt > 0:  # Don't delay on first attempt
+        if attempt > 0:
+            logging.info(f"Call {call_sid}: Retrying download in {delay} seconds...")
             time.sleep(delay)
-        
-        # Try authenticated download first
-        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-            try:
-                logging.info(f"Call {call_sid}: Attempting authenticated download")
-                auth_tuple = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                response = requests.get(recording_url, auth=auth_tuple, timeout=15)
-                response.raise_for_status()
-                
-                if len(response.content) > 0:
-                    logging.info(f"Call {call_sid}: Authenticated download successful ({len(response.content)} bytes)")
-                    return response.content
-                else:
-                    logging.warning(f"Call {call_sid}: Authenticated download returned 0 bytes")
-                    
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 404:
-                    logging.warning(f"Call {call_sid}: Authenticated download 404 - recording not ready")
-                    last_error = f"Recording not found (attempt {attempt + 1})"
-                else:
-                    logging.error(f"Call {call_sid}: Authenticated download HTTP error: {e.response.status_code}")
-                    last_error = f"HTTP {e.response.status_code} (attempt {attempt + 1})"
-            except Exception as e:
-                logging.warning(f"Call {call_sid}: Authenticated download failed: {e}")
-                last_error = f"Auth download error: {e}"
-        
-        # Try unauthenticated download as fallback
+        delay = min(delay * 2, 10)
+
         try:
-            logging.info(f"Call {call_sid}: Attempting unauthenticated download")
-            response = requests.get(recording_url, timeout=15)
+            logging.info(f"Call {call_sid}: Attempting authenticated download (attempt {attempt+1})")
+            auth_tuple = (TWILIO_ACCOUNT_SID.strip(), TWILIO_AUTH_TOKEN.strip())
+            response = requests.get(recording_url, auth=auth_tuple, timeout=15)
             response.raise_for_status()
             
             if len(response.content) > 0:
-                logging.info(f"Call {call_sid}: Unauthenticated download successful ({len(response.content)} bytes)")
+                logging.info(f"Call {call_sid}: Successfully downloaded {len(response.content)} bytes")
                 return response.content
             else:
-                logging.warning(f"Call {call_sid}: Unauthenticated download returned 0 bytes")
+                logging.warning(f"Call {call_sid}: Downloaded empty content")
                 
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                logging.warning(f"Call {call_sid}: Unauthenticated download 404 - recording not ready") 
-                last_error = f"Recording not found (attempt {attempt + 1})"
+            if e.response.status_code == 401:
+                logging.error(f"Call {call_sid}: Unauthorized (401) - check Twilio credentials")
+                break  # No point retrying auth errors
+            elif e.response.status_code == 404:
+                logging.warning(f"Call {call_sid}: Recording not ready yet (404), attempt {attempt+1}")
             else:
-                logging.error(f"Call {call_sid}: Unauthenticated download HTTP error: {e.response.status_code}")
-                last_error = f"HTTP {e.response.status_code} (attempt {attempt + 1})"
+                logging.error(f"Call {call_sid}: HTTP error {e.response.status_code}: {e}")
         except Exception as e:
-            logging.warning(f"Call {call_sid}: Unauthenticated download failed: {e}")
-            last_error = f"Unauth download error: {e}"
-        
-        # Exponential backoff for next attempt
-        delay = min(delay * 2, 10)  # Cap at 10 seconds
-    
-    logging.error(f"Call {call_sid}: All {max_retries} download attempts failed. Last error: {last_error}")
+            logging.error(f"Call {call_sid}: Download error attempt {attempt+1}: {e}")
+
+    logging.error(f"Call {call_sid}: All download attempts failed for {recording_url}")
     return None
 
-# --- Text-to-Speech (ElevenLabs) Helper ---
-def text_to_elevenlabs_audio(text_to_speak, call_sid_for_log=""):
-    if not (ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID):
-        logging.warning(f"Call {call_sid_for_log}: ElevenLabs API key or Voice ID missing. Cannot generate custom audio.")
-        return None, text_to_speak
-
-    filename = f"sol_audio_{uuid.uuid4().hex}.mp3"
-    audio_file_path = os.path.join(TEMP_AUDIO_DIR_PATH, filename)
-    public_audio_url = f"{AUDIO_HOST_URL}/{TEMP_AUDIO_DIR_NAME}/{filename}"
-
-    logging.info(f"Call {call_sid_for_log}: Requesting audio from ElevenLabs for: '{text_to_speak[:80]}...'")
+def generate_elevenlabs_audio(text, call_sid):
+    """Generate audio using ElevenLabs TTS."""
+    if not ELEVENLABS_API_KEY:
+        logging.warning(f"Call {call_sid}: ElevenLabs API key not set, skipping TTS")
+        return None
+    
     try:
-        tts_response = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-            headers={"Accept": "audio/mpeg", "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-            json={"text": text_to_speak, "model_id": "eleven_monolingual_v1", "voice_settings": {"stability": 0.7, "similarity_boost": 0.75}},
-            timeout=20, stream=True
-        )
-        tts_response.raise_for_status()
-        total_bytes_written = 0
-        with open(audio_file_path, "wb") as f:
-            for chunk in tts_response.iter_content(chunk_size=4096):
-                if chunk: f.write(chunk); total_bytes_written += len(chunk)
-        logging.info(f"Call {call_sid_for_log}: Total bytes written for MP3 from ElevenLabs: {total_bytes_written}")
-        if total_bytes_written == 0:
-            logging.error(f"Call {call_sid_for_log}: ElevenLabs returned 200 OK but 0 bytes audio for: '{text_to_speak[:80]}...'. Forcing Polly.")
-            if os.path.exists(audio_file_path):
-                try: os.remove(audio_file_path); logging.info(f"Removed empty file: {audio_file_path}")
-                except OSError as rm_err: logging.warning(f"Could not remove empty file '{audio_file_path}': {rm_err}")
-            return None, text_to_speak
-        time.sleep(0.5)
-        logging.info(f"Call {call_sid_for_log}: Saved ElevenLabs MP3: {audio_file_path}. URL: {public_audio_url}")
-        return public_audio_url, text_to_speak
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"Call {call_sid_for_log}: HTTP error ElevenLabs: {http_err.response.status_code} - {http_err.response.text[:200]}", exc_info=True)
-        notify_error(call_sid_for_log, f"TTS for: {text_to_speak[:50]}...", f"ElevenLabs HTTP Err: {http_err.response.status_code}..")
-        return None, text_to_speak
-    except requests.exceptions.RequestException as req_err:
-        logging.error(f"Call {call_sid_for_log}: Network error ElevenLabs:", exc_info=True)
-        notify_error(call_sid_for_log, f"TTS for: {text_to_speak[:50]}...", f"ElevenLabs Net Err: {req_err}")
-        return None, text_to_speak
+        logging.info(f"Call {call_sid}: Requesting audio from ElevenLabs for: '{text[:50]}...'")
+        
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": ELEVENLABS_API_KEY
+        }
+        
+        data = {
+            "text": text,
+            "model_id": "eleven_turbo_v2_5",
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.8,
+                "style": 0.0,
+                "use_speaker_boost": True
+            }
+        }
+        
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+        response = requests.post(url, json=data, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        if len(response.content) > 0:
+            logging.info(f"Call {call_sid}: Total bytes written for MP3 from ElevenLabs: {len(response.content)}")
+            return response.content
+        else:
+            logging.error(f"Call {call_sid}: ElevenLabs returned empty audio")
+            return None
+            
     except Exception as e:
-        logging.error(f"Call {call_sid_for_log}: Unexpected error in text_to_elevenlabs_audio:", exc_info=True)
-        notify_error(call_sid_for_log, f"TTS for: {text_to_speak[:50]}...", f"TTS Gen Err: {e}")
-        return None, text_to_speak
+        logging.error(f"Call {call_sid}: ElevenLabs TTS error: {e}")
+        return None
+
+def save_audio_file(audio_content, call_sid, prefix="sol_audio"):
+    """Save audio content to file and return URL."""
+    try:
+        unique_id = str(uuid.uuid4()).replace('-', '')
+        filename = f"{prefix}_{unique_id}.mp3"
+        file_path = os.path.join(TEMP_AUDIO_DIR_PATH, filename)
+        
+        with open(file_path, 'wb') as f:
+            f.write(audio_content)
+        
+        audio_url = f"{AUDIO_HOST_URL}/{TEMP_AUDIO_DIR_NAME}/{filename}"
+        logging.info(f"Call {call_sid}: Saved audio file: {file_path}. URL: {audio_url}")
+        return audio_url
+        
+    except Exception as e:
+        logging.error(f"Call {call_sid}: Failed to save audio file: {e}")
+        return None
+
+def say_fallback_with_gather(text, call_sid):
+    """Generate fallback TwiML with Polly voice."""
+    logging.info(f"Using say_fallback_with_gather for: '{text[:50]}...'")
+    
+    response = VoiceResponse()
+    response.say(text, language="en-AU", voice="Polly.Brian")
+    response.record(
+        action="/handle_speech_input",
+        method="POST",
+        max_length=30,
+        timeout=7,
+        play_beep=False,
+        trim="trim-silence"
+    )
+    
+    twiml_str = str(response)
+    logging.info(f"Fallback TwiML (with Record): {twiml_str}")
+    return twiml_str
+
+# ------------------------------------------------------------------
+# Flask Routes
+# ------------------------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ Sol Voice v3.6.4 is live."
+
+@app.route(f"/{TEMP_AUDIO_DIR_NAME}/<path:filename>")
+def serve_audio(filename):
+    """Serve audio files."""
+    try:
+        safe_filename = os.path.basename(filename)
+        logging.info(f"Attempting to serve audio file: {safe_filename} from {TEMP_AUDIO_DIR_PATH}")
+        return send_from_directory(TEMP_AUDIO_DIR_PATH, safe_filename, as_attachment=False)
+    except FileNotFoundError:
+        logging.error(f"Audio file not found: {filename}")
+        return "File not found", 404
+    except Exception as e:
+        logging.error(f"Error serving audio file {filename}: {e}")
+        return "Error serving file", 500
 
 @app.route("/voice", methods=["POST"])
-def initial_voice_handler():
-    call_sid = request.values.get("CallSid", "UnknownCallSid")
+def handle_incoming_call():
+    """Handle incoming Twilio voice calls."""
+    call_sid = request.form.get('CallSid', 'unknown')
     logging.info(f"Initial call {call_sid} received at /voice.")
-    if not client:
-        error_msg = "OpenAI client not initialized. Cannot proceed."
-        logging.error(f"Call {call_sid}: {error_msg}")
-        notify_error(call_sid, "Initial Call", error_msg)
-        return say_fallback("Our system is experiencing issues. Please try again later.")
-    greeting_text = "Hello! You've reached Northern Skin Doctors. This is Sol, your virtual assistant. How can I assist you today?"
-    public_audio_url, _ = text_to_elevenlabs_audio(greeting_text, call_sid)
-    vr = VoiceResponse()
-    if public_audio_url: vr.play(public_audio_url)
-    else: logging.warning(f"Call {call_sid}: ElevenLabs failed for initial greeting, using Polly."); vr.say(greeting_text, voice="Polly.Brian", language="en-AU")
-    record = Record(action="/handle_speech_input", method="POST", timeout=7, maxLength=30, playBeep=False, trim="trim-silence")
-    vr.append(record)
-    twiml_to_send = str(vr); logging.info(f"Call {call_sid}: Responding from /voice with TwiML: {twiml_to_send}"); return Response(twiml_to_send, mimetype="text/xml")
+    
+    try:
+        greeting_text = (
+            "Hello! You've reached Northern Skin Doctors. This is Sol, your virtual assistant. "
+            "I'm here to help with appointments, questions about our services, or general inquiries. "
+            "How can I assist you today?"
+        )
+        
+        # Try ElevenLabs first
+        audio_content = generate_elevenlabs_audio(greeting_text, call_sid)
+        
+        if audio_content:
+            audio_url = save_audio_file(audio_content, call_sid)
+            if audio_url:
+                response = VoiceResponse()
+                response.play(audio_url)
+                response.record(
+                    action="/handle_speech_input",
+                    method="POST",
+                    max_length=30,
+                    timeout=7,
+                    play_beep=False,
+                    trim="trim-silence"
+                )
+                
+                twiml_str = str(response)
+                logging.info(f"Call {call_sid}: Responding from /voice with TwiML: {twiml_str}")
+                return Response(twiml_str, mimetype="application/xml")
+        
+        # Fallback to Polly
+        logging.warning(f"Call {call_sid}: ElevenLabs failed, using Polly fallback")
+        fallback_twiml = say_fallback_with_gather(greeting_text, call_sid)
+        return Response(fallback_twiml, mimetype="application/xml")
+        
+    except Exception as e:
+        logging.error(f"Call {call_sid}: Error in /voice: {e}")
+        send_error_email(call_sid, f"Error in /voice endpoint: {e}")
+        
+        # Emergency fallback
+        emergency_response = VoiceResponse()
+        emergency_response.say(
+            "I'm sorry, there's a technical issue. Please call back later or visit our website.",
+            language="en-AU", 
+            voice="Polly.Brian"
+        )
+        return Response(str(emergency_response), mimetype="application/xml")
 
 @app.route("/handle_speech_input", methods=["POST"])
 def handle_speech_input():
-    call_sid = request.values.get("CallSid", "UnknownCallSid")
-    recording_url = request.values.get("RecordingUrl")
-    recording_duration_str = request.values.get("RecordingDuration", "0")
-    
-    try: 
-        recording_duration = int(recording_duration_str)
-    except ValueError: 
-        logging.warning(f"Call {call_sid}: Invalid RecordingDuration '{recording_duration_str}'. Defaulting to 0.")
-        recording_duration = 0
+    """Handle speech input from Twilio."""
+    call_sid = request.form.get('CallSid', 'unknown')
+    recording_url = request.form.get('RecordingUrl', '')
+    recording_duration = request.form.get('RecordingDuration', '0')
     
     logging.info(f"Call {call_sid}: /handle_speech_input. RecordingURL: {recording_url}, Duration: {recording_duration}s")
-
-    if not client: 
-        error_msg = "OpenAI client not initialized. Cannot process speech."
-        logging.error(f"Call {call_sid}: {error_msg}")
-        notify_error(call_sid, f"RecordingURL: {recording_url}", error_msg)
-        return say_fallback("Our system is having trouble. Please try again later.")
-
-    speech_result = ""
-    if recording_url:
-        # Use enhanced download function with retry logic
+    
+    if not recording_url:
+        logging.error(f"Call {call_sid}: No recording URL provided")
+        send_error_email(call_sid, "No recording URL in speech input")
+        fallback_text = "I didn't receive your message. Could you please try again?"
+        return Response(say_fallback_with_gather(fallback_text, call_sid), mimetype="application/xml")
+    
+    try:
+        # Download the recording
         audio_content = download_recording_with_retry(recording_url, call_sid)
         
-        if audio_content:
-            try:
-                audio_file_obj = io.BytesIO(audio_content)
-                audio_file_obj.name = f"rec_{call_sid}.wav"
-                logging.info(f"Call {call_sid}: Transcribing audio ({len(audio_content)} bytes) via Whisper.")
-                transcript_response = client.audio.transcriptions.create(model="whisper-1", file=audio_file_obj)
-                speech_result = transcript_response.text.strip()
-                logging.info(f"Call {call_sid}: Whisper transcript: '{speech_result}'")
-            except Exception as e:
-                logging.error(f"Call {call_sid}: Whisper transcription error: {e}", exc_info=True)
-                notify_error(call_sid, f"RecURL: {recording_url}", f"Whisper Error: {e}")
-                return say_fallback_with_gather("I had trouble understanding that. Could you say it again?")
-        else:
-            logging.error(f"Call {call_sid}: Failed to download recording after all retry attempts")
-            notify_error(call_sid, f"RecURL: {recording_url}", "Audio download failed after retries")
-            return say_fallback_with_gather("I had trouble retrieving what you said. Could you please repeat that?")
+        if not audio_content:
+            logging.error(f"Call {call_sid}: Failed to download recording")
+            send_error_email(call_sid, f"Failed to download recording: {recording_url}")
+            fallback_text = "I had trouble getting your recording. Could you please repeat that?"
+            return Response(say_fallback_with_gather(fallback_text, call_sid), mimetype="application/xml")
         
-    elif recording_duration == 0: 
-        logging.info(f"Call {call_sid}: No speech detected (0s duration).")
-        speech_result = ""
-    else: 
-        logging.warning(f"Call {call_sid}: No RecordingUrl. Duration: {recording_duration}s.")
-        speech_result = ""
-    
-    user_message_for_gpt = speech_result or "Is anyone there?"
-    logging.info(f"Call {call_sid}: Sending to OpenAI GPT-4o: '{user_message_for_gpt}'")
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message_for_gpt}
-    ]
-    
-    gpt_reply_text = "I'm sorry, I'm having a little trouble formulating a response. Please try again shortly."
-    try:
-        openai_response = client.chat.completions.create(model="gpt-4o", messages=messages, temperature=0.4)
-        gpt_reply_text = openai_response.choices[0].message.content.strip()
-        logging.info(f"Call {call_sid}: GPT-4o reply: '{gpt_reply_text}'")
-    except Exception as e:
-        logging.error(f"Call {call_sid}: Error calling OpenAI GPT-4o:", exc_info=True)
-        notify_error(call_sid, user_message_for_gpt, f"OpenAI GPT-4o Error: {traceback.format_exc()}")
-
-    public_audio_url, fallback_text = text_to_elevenlabs_audio(gpt_reply_text, call_sid)
-    vr = VoiceResponse()
-    if public_audio_url: 
-        vr.play(public_audio_url)
-    else: 
-        logging.warning(f"Call {call_sid}: ElevenLabs failed for GPT reply, using Polly for: '{fallback_text[:80]}...'")
-        vr.say(fallback_text, voice="Polly.Brian", language="en-AU")
-    
-    if not ("hang up and call 000" in gpt_reply_text.lower()):
-        record_next = Record(action="/handle_speech_input", method="POST", timeout=7, maxLength=30, playBeep=False, trim="trim-silence")
-        vr.append(record_next)
-    else: 
-        logging.info(f"Emergency message for {call_sid}. Not recording.")
-    
-    twiml_to_send = str(vr)
-    logging.info(f"Call {call_sid}: Responding from /handle_speech_input with TwiML: {twiml_to_send}")
-    return Response(twiml_to_send, mimetype="text/xml")
-
-# ------------------------------------------------------------------
-# Test Transcript Endpoint (NEW)
-# ------------------------------------------------------------------
-@app.route("/test-transcript", methods=["GET"])
-def test_transcript():
-    input_text = request.args.get("text", "Hello this is a test booking a skin check for Thursday.")
-    call_sid = f"TEST-{uuid.uuid4().hex[:8]}" # Made test CallSid slightly longer
-    logging.info(f"[Test Mode /test-transcript] Simulating pipeline for text: '{input_text}' with CallSid: {call_sid}")
-
-    if not client:
-        logging.error("[Test Mode /test-transcript] OpenAI client is not initialized.")
-        return {"success": False, "error": "OpenAI client not initialized. Check server logs."}, 500
-
-    try:
-        # Use the global SYSTEM_PROMPT for consistency
-        messages_for_gpt = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": input_text}
-        ]
-        logging.info(f"[Test Mode /test-transcript] Sending to GPT-4o: {messages_for_gpt}")
-        gpt_response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages_for_gpt,
-            temperature=0.4 # Consistent with main voice logic
+        # Transcribe with Whisper
+        if not client:
+            logging.error(f"Call {call_sid}: OpenAI client not initialized")
+            send_error_email(call_sid, "OpenAI client not available")
+            fallback_text = "I'm having trouble processing your request. Please try again."
+            return Response(say_fallback_with_gather(fallback_text, call_sid), mimetype="application/xml")
+        
+        audio_file = io.BytesIO(audio_content)
+        audio_file.name = "recording.wav"  # Whisper needs a filename
+        
+        logging.info(f"Call {call_sid}: Transcribing audio with Whisper...")
+        transcription = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="en"
         )
-        gpt_reply_text = gpt_response.choices[0].message.content.strip()
-        logging.info(f"[Test Mode /test-transcript] GPT-4o reply: '{gpt_reply_text}'")
-
-        # Generate audio using the existing helper
-        audio_url, fallback_text_if_audio_fails = text_to_elevenlabs_audio(gpt_reply_text, call_sid_for_log=call_sid)
         
-        if audio_url:
-            logging.info(f"[Test Mode /test-transcript] Successfully generated audio URL: {audio_url}")
-            return {
-                "success": True,
-                "input_text": input_text,
-                "gpt_reply": gpt_reply_text,
-                "audio_url": audio_url,
-                "note": "You can play this audio_url in your browser."
-            }, 200
-        else:
-            logging.error(f"[Test Mode /test-transcript] Failed to generate audio for GPT reply: '{fallback_text_if_audio_fails}'. Polly would be used in a real call.")
-            return {
-                "success": False,
-                "input_text": input_text,
-                "gpt_reply": gpt_reply_text, # Still useful to see GPT's text response
-                "error": "Failed to generate ElevenLabs audio. Fallback to Polly would occur in a live call.",
-                "polly_would_say": fallback_text_if_audio_fails
-            }, 500 # Indicates an issue in the audio generation part of the test
-
+        user_text = transcription.text.strip()
+        logging.info(f"Call {call_sid}: Transcribed: '{user_text}'")
+        
+        if not user_text:
+            logging.warning(f"Call {call_sid}: Empty transcription")
+            fallback_text = "I couldn't hear what you said clearly. Could you please repeat that?"
+            return Response(say_fallback_with_gather(fallback_text, call_sid), mimetype="application/xml")
+        
+        # Generate response with GPT-4
+        logging.info(f"Call {call_sid}: Generating response with GPT-4...")
+        chat_response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text}
+            ],
+            max_tokens=200,
+            temperature=0.7
+        )
+        
+        ai_response = chat_response.choices[0].message.content.strip()
+        logging.info(f"Call {call_sid}: GPT-4 response: '{ai_response}'")
+        
+        # Generate audio response
+        audio_content = generate_elevenlabs_audio(ai_response, call_sid)
+        
+        if audio_content:
+            audio_url = save_audio_file(audio_content, call_sid)
+            if audio_url:
+                response = VoiceResponse()
+                response.play(audio_url)
+                response.record(
+                    action="/handle_speech_input",
+                    method="POST",
+                    max_length=30,
+                    timeout=7,
+                    play_beep=False,
+                    trim="trim-silence"
+                )
+                return Response(str(response), mimetype="application/xml")
+        
+        # Fallback to Polly
+        logging.warning(f"Call {call_sid}: Using Polly fallback for response")
+        return Response(say_fallback_with_gather(ai_response, call_sid), mimetype="application/xml")
+        
     except Exception as e:
-        logging.error(f"[Test Mode /test-transcript] General Error: {e}", exc_info=True)
-        return {"success": False, "error": str(e), "input_text": input_text}, 500
+        logging.error(f"Call {call_sid}: Error in /handle_speech_input: {e}")
+        logging.error(traceback.format_exc())
+        send_error_email(call_sid, f"Error in speech input handler: {e}\n{traceback.format_exc()}")
+        
+        fallback_text = "I encountered an issue processing your request. Could you please try again?"
+        return Response(say_fallback_with_gather(fallback_text, call_sid), mimetype="application/xml")
 
 # ------------------------------------------------------------------
-# Helper Functions (notify_error, say_fallback, say_fallback_with_gather)
+# Application Startup
 # ------------------------------------------------------------------
-def say_fallback(text_to_say): # For critical errors, no gather
-    logging.info(f"Using say_fallback (no gather) for: '{text_to_say[:80]}...'")
-    vr = VoiceResponse(); vr.say(text_to_say, voice="Polly.Brian", language="en-AU")
-    twiml_to_send = str(vr); logging.info(f"Fallback TwiML (no gather): {twiml_to_send}"); return Response(twiml_to_send, mimetype="text/xml")
 
-def say_fallback_with_gather(text_to_say): # For non-critical, continue with Record
-    logging.info(f"Using say_fallback_with_gather for: '{text_to_say[:80]}...'")
-    vr = VoiceResponse(); vr.say(text_to_say, voice="Polly.Brian", language="en-AU")
-    if not ("hang up and call 000" in text_to_say.lower()):
-        record = Record(action="/handle_speech_input", method="POST", timeout=7, maxLength=30, playBeep=False, trim="trim-silence")
-        vr.append(record)
-    else: logging.info(f"Emergency in say_fallback_with_gather. Not recording.")
-    twiml_to_send = str(vr); logging.info(f"Fallback TwiML (with Record): {twiml_to_send}"); return Response(twiml_to_send, mimetype="text/xml")
-
-def notify_error(call_sid, context, error_details):
-    if not (SMTP_SERVER and SMTP_PORT and SMTP_USERNAME and SMTP_PASSWORD and ADMIN_EMAIL):
-        logging.error(f"SMTP/AdminEmail missing. No error email for CallSid {call_sid}.")
-        return
-    msg = EmailMessage(); msg["Subject"] = f"[Sol Voice Error] Call {call_sid}"; msg["From"] = "Sol AI <no-reply@northernskindoctors.com.au>"; msg["To"] = ADMIN_EMAIL
-    msg.set_content(f"Error with Sol.\n\nCallSid: {call_sid}\nContext: '{context}'\n\nError:\n{error_details}")
-    try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as smtp: smtp.starttls(); smtp.login(SMTP_USERNAME, SMTP_PASSWORD); smtp.send_message(msg)
-        logging.info(f"Error email sent for CallSid {call_sid} to {ADMIN_EMAIL}.")
-    except Exception as e: logging.error(f"Failed to send error email for CallSid {call_sid}:", exc_info=True)
-
-# ------------------------------------------------------------------
-# Run App
-# ------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    use_debug_mode = os.getenv("FLASK_DEBUG", "False").lower() == "true"
-    app.run(host="0.0.0.0", port=port, debug=use_debug_mode)
+    debug_mode = os.getenv("FLASK_DEBUG", "False").lower() == "true"
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
