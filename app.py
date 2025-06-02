@@ -1,6 +1,6 @@
 """
 Sol Voice Assistant - GPT-4o + Whisper STT + ElevenLabs TTS
-Version: v3.6.0 (Added Test Endpoint & Unified Prompt)
+Version: v3.6.1 (Fixed Audio Download with Fallback Authentication)
 """
 
 import os
@@ -86,7 +86,7 @@ You are Sol, the emotionally intelligent AI receptionist for Northern Skin Docto
 You sound like a real person — warm, thoughtful, and precise. Never robotic.
 - Always respond clearly and helpfully.
 - If the caller wants to book, always ask for type of appointment, name, and preferred date.
-- Never say you are an AI. Never say you’re confused.
+- Never say you are an AI. Never say you're confused.
 - Always ask follow-up questions to keep the conversation flowing naturally unless the user explicitly says they are done or hangs up.
 - End helpful responses (like after taking booking details or answering a query) with: 'I'll pass this to the team to confirm by SMS. Thanks!'
 """
@@ -99,7 +99,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Sol Voice v3.6.0 is live (Added Test Endpoint & Unified Prompt)."
+    return "✅ Sol Voice v3.6.1 is live (Fixed Audio Download with Fallback Authentication)."
 
 @app.route(f"/{TEMP_AUDIO_DIR_NAME}/<path:filename>")
 def serve_audio(filename):
@@ -183,8 +183,13 @@ def handle_speech_input():
     call_sid = request.values.get("CallSid", "UnknownCallSid")
     recording_url = request.values.get("RecordingUrl")
     recording_duration_str = request.values.get("RecordingDuration", "0")
-    try: recording_duration = int(recording_duration_str)
-    except ValueError: logging.warning(f"Call {call_sid}: Invalid RecordingDuration '{recording_duration_str}'. Defaulting to 0."); recording_duration = 0
+    
+    try: 
+        recording_duration = int(recording_duration_str)
+    except ValueError: 
+        logging.warning(f"Call {call_sid}: Invalid RecordingDuration '{recording_duration_str}'. Defaulting to 0.")
+        recording_duration = 0
+    
     logging.info(f"Call {call_sid}: /handle_speech_input. RecordingURL: {recording_url}, Duration: {recording_duration}s")
 
     if not client: 
@@ -195,40 +200,64 @@ def handle_speech_input():
 
     speech_result = ""
     if recording_url:
-        try:
-            auth_tuple = None
-            if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        # Try authenticated download first, then fallback to unauthenticated
+        audio_content = None
+        
+        # First attempt: With authentication
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+            try:
+                logging.info(f"Call {call_sid}: Attempting authenticated download from Twilio.")
                 auth_tuple = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                logging.info(f"Call {call_sid}: Attempting to download Twilio recording WITH authentication.")
-            else:
-                logging.warning(f"Call {call_sid}: TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set. Attempting UNauthenticated download of Twilio recording.")
-            audio_get_response = requests.get(recording_url, auth=auth_tuple, timeout=10)
-            audio_get_response.raise_for_status()
-            audio_content = io.BytesIO(audio_get_response.content); audio_content.name = f"rec_{call_sid}.wav"
-            logging.info(f"Call {call_sid}: Transcribing audio ({len(audio_get_response.content)} bytes) via Whisper.")
-            transcript_response = client.audio.transcriptions.create(model="whisper-1", file=audio_content)
-            speech_result = transcript_response.text.strip()
-            logging.info(f"Call {call_sid}: Whisper transcript: '{speech_result}'")
-        except requests.exceptions.HTTPError as http_err: # Error downloading audio
-            logging.error(f"Call {call_sid}: Failed Twilio audio download: {http_err.response.status_code} - {http_err.response.text[:200]}", exc_info=True)
-            notify_error(call_sid, f"RecURL: {recording_url}", f"Twilio Audio DL HTTP Err: {http_err.response.status_code}")
-            return say_fallback_with_gather("I had trouble retrieving what you said. Could you please repeat that?")
-        except requests.exceptions.RequestException as req_err: # Other network errors for download
-            logging.error(f"Call {call_sid}: Failed Twilio audio download (Net): {req_err}", exc_info=True)
-            notify_error(call_sid, f"RecURL: {recording_url}", f"Twilio Audio DL Net Err: {req_err}")
-            return say_fallback_with_gather("Couldn't get what you said due to a network hiccup. Please say it again.")
-        except Exception as e: # Catch OpenAI errors during transcription or other issues
-            logging.error(f"Call {call_sid}: Whisper transcription/audio handling error: {e}", exc_info=True)
-            notify_error(call_sid, f"RecURL: {recording_url}", f"Whisper/Audio Err: {e}")
-            return say_fallback_with_gather("I had a bit of trouble understanding that. Could you say it again?")
-    elif recording_duration == 0: logging.info(f"Call {call_sid}: No speech detected (0s duration)."); speech_result = ""
-    else: logging.warning(f"Call {call_sid}: No RecordingUrl. Duration: {recording_duration}s."); speech_result = ""
+                audio_get_response = requests.get(recording_url, auth=auth_tuple, timeout=10)
+                audio_get_response.raise_for_status()
+                audio_content = audio_get_response.content
+                logging.info(f"Call {call_sid}: Authenticated download successful ({len(audio_content)} bytes)")
+            except requests.exceptions.HTTPError as http_err:
+                logging.warning(f"Call {call_sid}: Authenticated download failed: {http_err.response.status_code}. Trying unauthenticated...")
+                audio_content = None
+            except Exception as e:
+                logging.warning(f"Call {call_sid}: Authenticated download error: {e}. Trying unauthenticated...")
+                audio_content = None
+        
+        # Second attempt: Without authentication (fallback)
+        if audio_content is None:
+            try:
+                logging.info(f"Call {call_sid}: Attempting unauthenticated download from Twilio.")
+                audio_get_response = requests.get(recording_url, timeout=10)
+                audio_get_response.raise_for_status()
+                audio_content = audio_get_response.content
+                logging.info(f"Call {call_sid}: Unauthenticated download successful ({len(audio_content)} bytes)")
+            except Exception as e:
+                logging.error(f"Call {call_sid}: Both authenticated and unauthenticated downloads failed: {e}")
+                notify_error(call_sid, f"RecURL: {recording_url}", f"Audio download failed: {e}")
+                return say_fallback_with_gather("I had trouble getting your recording. Could you please repeat that?")
+        
+        # Now transcribe the audio
+        if audio_content:
+            try:
+                audio_file_obj = io.BytesIO(audio_content)
+                audio_file_obj.name = f"rec_{call_sid}.wav"
+                logging.info(f"Call {call_sid}: Transcribing audio ({len(audio_content)} bytes) via Whisper.")
+                transcript_response = client.audio.transcriptions.create(model="whisper-1", file=audio_file_obj)
+                speech_result = transcript_response.text.strip()
+                logging.info(f"Call {call_sid}: Whisper transcript: '{speech_result}'")
+            except Exception as e:
+                logging.error(f"Call {call_sid}: Whisper transcription error: {e}", exc_info=True)
+                notify_error(call_sid, f"RecURL: {recording_url}", f"Whisper Error: {e}")
+                return say_fallback_with_gather("I had trouble understanding that. Could you say it again?")
+        
+    elif recording_duration == 0: 
+        logging.info(f"Call {call_sid}: No speech detected (0s duration).")
+        speech_result = ""
+    else: 
+        logging.warning(f"Call {call_sid}: No RecordingUrl. Duration: {recording_duration}s.")
+        speech_result = ""
     
     user_message_for_gpt = speech_result or "Is anyone there?"
     logging.info(f"Call {call_sid}: Sending to OpenAI GPT-4o: '{user_message_for_gpt}'")
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT}, # Using global SYSTEM_PROMPT
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message_for_gpt}
     ]
     
@@ -243,15 +272,21 @@ def handle_speech_input():
 
     public_audio_url, fallback_text = text_to_elevenlabs_audio(gpt_reply_text, call_sid)
     vr = VoiceResponse()
-    if public_audio_url: vr.play(public_audio_url)
-    else: logging.warning(f"Call {call_sid}: ElevenLabs failed for GPT reply, using Polly for: '{fallback_text[:80]}...'"); vr.say(fallback_text, voice="Polly.Brian", language="en-AU")
+    if public_audio_url: 
+        vr.play(public_audio_url)
+    else: 
+        logging.warning(f"Call {call_sid}: ElevenLabs failed for GPT reply, using Polly for: '{fallback_text[:80]}...'")
+        vr.say(fallback_text, voice="Polly.Brian", language="en-AU")
     
     if not ("hang up and call 000" in gpt_reply_text.lower()):
         record_next = Record(action="/handle_speech_input", method="POST", timeout=7, maxLength=30, playBeep=False, trim="trim-silence")
         vr.append(record_next)
-    else: logging.info(f"Emergency message for {call_sid}. Not recording.")
+    else: 
+        logging.info(f"Emergency message for {call_sid}. Not recording.")
     
-    twiml_to_send = str(vr); logging.info(f"Call {call_sid}: Responding from /handle_speech_input with TwiML: {twiml_to_send}"); return Response(twiml_to_send, mimetype="text/xml")
+    twiml_to_send = str(vr)
+    logging.info(f"Call {call_sid}: Responding from /handle_speech_input with TwiML: {twiml_to_send}")
+    return Response(twiml_to_send, mimetype="text/xml")
 
 # ------------------------------------------------------------------
 # Test Transcript Endpoint (NEW)
