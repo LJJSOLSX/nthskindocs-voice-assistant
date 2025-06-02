@@ -1,6 +1,6 @@
 """
 Sol Voice Assistant - GPT-4o + Whisper STT + ElevenLabs TTS
-Version: v3.6.1 (Fixed Audio Download with Fallback Authentication)
+Version: v3.6.2 (Enhanced Audio Download with Retry Logic and Recording Status Verification)
 """
 
 import os
@@ -10,6 +10,7 @@ import smtplib
 from email.message import EmailMessage
 from flask import Flask, request, Response, send_from_directory # Added request here
 from twilio.twiml.voice_response import VoiceResponse, Play, Record
+from twilio.rest import Client
 from openai import OpenAI
 import uuid
 import requests
@@ -68,6 +69,17 @@ try:
 except Exception as e:
     logging.error("CRITICAL STARTUP ERROR: Failed to initialize OpenAI client:", exc_info=True)
 
+# Initialize Twilio client for recording verification
+twilio_client = None
+try:
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        logging.info("Twilio client initialized successfully at startup.")
+    else:
+        logging.warning("Twilio client not initialized: credentials missing.")
+except Exception as e:
+    logging.error("Failed to initialize Twilio client:", exc_info=True)
+
 # Temporary Audio File Setup
 TEMP_AUDIO_DIR_NAME = "temp_audio_files"
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -90,7 +102,6 @@ You sound like a real person — warm, thoughtful, and precise. Never robotic.
 - Always ask follow-up questions to keep the conversation flowing naturally unless the user explicitly says they are done or hangs up.
 - End helpful responses (like after taking booking details or answering a query) with: 'I'll pass this to the team to confirm by SMS. Thanks!'
 """
-# Specific examples from your test prompt can be further integrated here or handled by GPT's general understanding.
 
 # ------------------------------------------------------------------
 # Flask App Setup
@@ -99,7 +110,7 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Sol Voice v3.6.1 is live (Fixed Audio Download with Fallback Authentication)."
+    return "✅ Sol Voice v3.6.2 is live (Enhanced Audio Download with Retry Logic)."
 
 @app.route(f"/{TEMP_AUDIO_DIR_NAME}/<path:filename>")
 def serve_audio(filename):
@@ -113,9 +124,123 @@ def serve_audio(filename):
         logging.error(f"Error serving audio file {filename}:", exc_info=True)
         return "Error serving file", 500
 
+# ------------------------------------------------------------------
+# Enhanced Recording Download Functions
+# ------------------------------------------------------------------
+def extract_recording_sid_from_url(recording_url):
+    """Extract recording SID from Twilio recording URL"""
+    try:
+        # URL format: https://api.twilio.com/2010-04-01/Accounts/{AccountSid}/Recordings/{RecordingSid}
+        parts = recording_url.split('/')
+        if 'Recordings' in parts:
+            recording_sid_index = parts.index('Recordings') + 1
+            if recording_sid_index < len(parts):
+                return parts[recording_sid_index].split('.')[0]  # Remove any file extension
+    except Exception as e:
+        logging.error(f"Failed to extract recording SID from URL {recording_url}: {e}")
+    return None
+
+def wait_for_recording_completion(recording_sid, call_sid, timeout=15):
+    """Wait for recording to be fully processed by Twilio"""
+    if not twilio_client:
+        logging.warning(f"Call {call_sid}: No Twilio client available for recording status check")
+        return False
+    
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            recording = twilio_client.recordings(recording_sid).fetch()
+            logging.info(f"Call {call_sid}: Recording {recording_sid} status: {recording.status}")
+            
+            if recording.status == 'completed':
+                return True
+            elif recording.status == 'failed':
+                logging.error(f"Call {call_sid}: Recording {recording_sid} failed")
+                return False
+                
+            time.sleep(1)  # Wait 1 second before checking again
+        except Exception as e:
+            logging.warning(f"Call {call_sid}: Error checking recording status: {e}")
+            time.sleep(1)
+    
+    logging.warning(f"Call {call_sid}: Timeout waiting for recording {recording_sid} completion")
+    return False
+
+def download_recording_with_retry(recording_url, call_sid, max_retries=3, initial_delay=2):
+    """Download recording with exponential backoff retry logic"""
+    recording_sid = extract_recording_sid_from_url(recording_url)
+    
+    # First, wait for recording to be ready
+    if recording_sid and twilio_client:
+        logging.info(f"Call {call_sid}: Waiting for recording {recording_sid} to be ready")
+        if not wait_for_recording_completion(recording_sid, call_sid):
+            logging.warning(f"Call {call_sid}: Recording may not be ready, but proceeding with download attempts")
+    
+    delay = initial_delay
+    last_error = None
+    
+    for attempt in range(max_retries):
+        logging.info(f"Call {call_sid}: Download attempt {attempt + 1}/{max_retries} after {delay}s delay")
+        
+        if attempt > 0:  # Don't delay on first attempt
+            time.sleep(delay)
+        
+        # Try authenticated download first
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+            try:
+                logging.info(f"Call {call_sid}: Attempting authenticated download")
+                auth_tuple = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                response = requests.get(recording_url, auth=auth_tuple, timeout=15)
+                response.raise_for_status()
+                
+                if len(response.content) > 0:
+                    logging.info(f"Call {call_sid}: Authenticated download successful ({len(response.content)} bytes)")
+                    return response.content
+                else:
+                    logging.warning(f"Call {call_sid}: Authenticated download returned 0 bytes")
+                    
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    logging.warning(f"Call {call_sid}: Authenticated download 404 - recording not ready")
+                    last_error = f"Recording not found (attempt {attempt + 1})"
+                else:
+                    logging.error(f"Call {call_sid}: Authenticated download HTTP error: {e.response.status_code}")
+                    last_error = f"HTTP {e.response.status_code} (attempt {attempt + 1})"
+            except Exception as e:
+                logging.warning(f"Call {call_sid}: Authenticated download failed: {e}")
+                last_error = f"Auth download error: {e}"
+        
+        # Try unauthenticated download as fallback
+        try:
+            logging.info(f"Call {call_sid}: Attempting unauthenticated download")
+            response = requests.get(recording_url, timeout=15)
+            response.raise_for_status()
+            
+            if len(response.content) > 0:
+                logging.info(f"Call {call_sid}: Unauthenticated download successful ({len(response.content)} bytes)")
+                return response.content
+            else:
+                logging.warning(f"Call {call_sid}: Unauthenticated download returned 0 bytes")
+                
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logging.warning(f"Call {call_sid}: Unauthenticated download 404 - recording not ready") 
+                last_error = f"Recording not found (attempt {attempt + 1})"
+            else:
+                logging.error(f"Call {call_sid}: Unauthenticated download HTTP error: {e.response.status_code}")
+                last_error = f"HTTP {e.response.status_code} (attempt {attempt + 1})"
+        except Exception as e:
+            logging.warning(f"Call {call_sid}: Unauthenticated download failed: {e}")
+            last_error = f"Unauth download error: {e}"
+        
+        # Exponential backoff for next attempt
+        delay = min(delay * 2, 10)  # Cap at 10 seconds
+    
+    logging.error(f"Call {call_sid}: All {max_retries} download attempts failed. Last error: {last_error}")
+    return None
+
 # --- Text-to-Speech (ElevenLabs) Helper ---
 def text_to_elevenlabs_audio(text_to_speak, call_sid_for_log=""):
-    # (This function remains the same as in v3.5.2 - includes byte checking & robust error handling)
     if not (ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID):
         logging.warning(f"Call {call_sid_for_log}: ElevenLabs API key or Voice ID missing. Cannot generate custom audio.")
         return None, text_to_speak
@@ -200,39 +325,9 @@ def handle_speech_input():
 
     speech_result = ""
     if recording_url:
-        # Try authenticated download first, then fallback to unauthenticated
-        audio_content = None
+        # Use enhanced download function with retry logic
+        audio_content = download_recording_with_retry(recording_url, call_sid)
         
-        # First attempt: With authentication
-        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-            try:
-                logging.info(f"Call {call_sid}: Attempting authenticated download from Twilio.")
-                auth_tuple = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                audio_get_response = requests.get(recording_url, auth=auth_tuple, timeout=10)
-                audio_get_response.raise_for_status()
-                audio_content = audio_get_response.content
-                logging.info(f"Call {call_sid}: Authenticated download successful ({len(audio_content)} bytes)")
-            except requests.exceptions.HTTPError as http_err:
-                logging.warning(f"Call {call_sid}: Authenticated download failed: {http_err.response.status_code}. Trying unauthenticated...")
-                audio_content = None
-            except Exception as e:
-                logging.warning(f"Call {call_sid}: Authenticated download error: {e}. Trying unauthenticated...")
-                audio_content = None
-        
-        # Second attempt: Without authentication (fallback)
-        if audio_content is None:
-            try:
-                logging.info(f"Call {call_sid}: Attempting unauthenticated download from Twilio.")
-                audio_get_response = requests.get(recording_url, timeout=10)
-                audio_get_response.raise_for_status()
-                audio_content = audio_get_response.content
-                logging.info(f"Call {call_sid}: Unauthenticated download successful ({len(audio_content)} bytes)")
-            except Exception as e:
-                logging.error(f"Call {call_sid}: Both authenticated and unauthenticated downloads failed: {e}")
-                notify_error(call_sid, f"RecURL: {recording_url}", f"Audio download failed: {e}")
-                return say_fallback_with_gather("I had trouble getting your recording. Could you please repeat that?")
-        
-        # Now transcribe the audio
         if audio_content:
             try:
                 audio_file_obj = io.BytesIO(audio_content)
@@ -245,6 +340,10 @@ def handle_speech_input():
                 logging.error(f"Call {call_sid}: Whisper transcription error: {e}", exc_info=True)
                 notify_error(call_sid, f"RecURL: {recording_url}", f"Whisper Error: {e}")
                 return say_fallback_with_gather("I had trouble understanding that. Could you say it again?")
+        else:
+            logging.error(f"Call {call_sid}: Failed to download recording after all retry attempts")
+            notify_error(call_sid, f"RecURL: {recording_url}", "Audio download failed after retries")
+            return say_fallback_with_gather("I had trouble retrieving what you said. Could you please repeat that?")
         
     elif recording_duration == 0: 
         logging.info(f"Call {call_sid}: No speech detected (0s duration).")
